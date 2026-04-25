@@ -1,0 +1,29 @@
+#!/command/with-contenv bash
+# Mastodon streaming (Node) longrun.
+#
+# The streaming service is a separate Node app the official compose
+# splits into its own image. We copied its sources + production
+# node_modules into /opt/mastodon-streaming at build time and pull in
+# the same secrets file that mastodon-web uses (DATABASE_URL,
+# REDIS_URL, SECRET_KEY_BASE — streaming verifies session cookies the
+# Rails side issues, so it MUST share SECRET_KEY_BASE).
+#
+# Binds 127.0.0.1:4000 — Caddy proxies /api/v1/streaming to it.
+set -eu
+
+cd /opt/mastodon-streaming
+
+SECRETS_FILE="${OPENHOST_APP_DATA_DIR:-/data/app_data/mastodon}/mastodon-secrets.env"
+if [[ ! -f "$SECRETS_FILE" ]]; then
+    echo "[mastodon-streaming] FATAL: secrets file missing: $SECRETS_FILE" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+set -a; source "$SECRETS_FILE"; set +a
+
+export BIND=127.0.0.1
+export PORT=4000
+export NODE_ENV=production
+
+exec s6-setuidgid mastodon \
+    /usr/local/bin/node ./streaming/index.js

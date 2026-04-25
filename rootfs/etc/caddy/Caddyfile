@@ -1,0 +1,100 @@
+# Caddy front-door for the all-in-one Mastodon container.
+#
+# Listens on :8080 (matches openhost.toml's `port`). Splits traffic
+# between the two upstream Mastodon processes:
+#
+#   /api/v1/streaming/*  →  127.0.0.1:4000  (node streaming, WebSockets)
+#   everything else      →  127.0.0.1:3000  (puma web, REST + UI)
+#
+# Mastodon's CSRF + ActivityPub signature checks compare the inbound
+# Host header against LOCAL_DOMAIN/WEB_DOMAIN. The OpenHost router
+# strips the original Host on the way through and stuffs the public
+# hostname into X-Forwarded-Host, so we rewrite Host back to that
+# before forwarding to puma. Same trick the openhost-forgejo
+# auth_proxy uses; mirrored here in Caddy syntax.
+#
+# We also bump proxy timeouts to match streaming's long-poll behaviour
+# (default upstream WebSocket idle is generous but a default-Caddy
+# install could time out a long-lived stream after 30s).
+{
+	# Disable automatic HTTPS — TLS terminates at the OpenHost router,
+	# this Caddy is a plain-HTTP backend.
+	auto_https off
+	# Reduce Caddy's own admin API to localhost only (it's used for
+	# config reloads, which we don't do).
+	admin off
+	# Quieter logs in production. Switch to DEBUG via env if needed.
+	log {
+		output stderr
+		level INFO
+		format console
+	}
+}
+
+:8080 {
+	# Trust the OpenHost router's X-Forwarded-* headers. Anything else
+	# would be rewritten/stripped here, but in practice we're behind
+	# exactly one proxy (the OpenHost router) and that proxy is what
+	# sets X-Forwarded-Host to the public hostname the user typed.
+	#
+	# `client_ip_headers` tells Caddy to populate {client_ip} from
+	# X-Forwarded-For so logs reflect the real visitor IP rather than
+	# the OpenHost router's container address.
+	servers {
+		client_ip_headers X-Forwarded-For
+		trusted_proxies static private_ranges
+	}
+}
+
+:8080 {
+	# Streaming: long-lived WebSocket + SSE connections to the node
+	# server. Order matters here — Caddy matches in the order written.
+	@streaming path /api/v1/streaming /api/v1/streaming/*
+	handle @streaming {
+		reverse_proxy 127.0.0.1:4000 {
+			# Override the upstream Host header to the public
+			# hostname. Streaming itself doesn't enforce a Host
+			# match (it's an API, not a CSRF-protected form),
+			# but keeping things consistent helps debugging.
+			header_up Host {http.request.header.X-Forwarded-Host}
+			# WebSocket connections idle long. 24h matches the
+			# upstream nginx config that ships with Mastodon's
+			# deployment guide.
+			transport http {
+				read_timeout 24h
+				write_timeout 24h
+				dial_timeout 5s
+			}
+		}
+	}
+
+	# Everything else → puma.
+	#
+	# `header_up Host` is the critical fix: without it, puma sees
+	# `Host: 127.0.0.1:3000` and Rails' CSRF middleware refuses every
+	# state-changing request with InvalidAuthenticityToken because the
+	# computed origin doesn't match LOCAL_DOMAIN.
+	#
+	# `header_up X-Forwarded-Proto` is set by Caddy automatically from
+	# the inbound request scheme, but the OpenHost router already
+	# terminated TLS — pass through whatever it told us so Mastodon
+	# generates `https://` URLs for federation.
+	handle {
+		reverse_proxy 127.0.0.1:3000 {
+			header_up Host {http.request.header.X-Forwarded-Host}
+			# Pass through the original X-Forwarded-Proto from
+			# OpenHost (always "https" in production); fall back
+			# to the scheme Caddy saw if the header is absent so
+			# local-only smoke tests still work.
+			header_up X-Forwarded-Proto {http.request.header.X-Forwarded-Proto}
+			# Fail fast on slow upstream — we'd rather return a
+			# 502 to the OpenHost router so the front-door can
+			# retry than tie up a Caddy worker indefinitely.
+			transport http {
+				read_timeout 5m
+				write_timeout 5m
+				dial_timeout 5s
+			}
+		}
+	}
+}

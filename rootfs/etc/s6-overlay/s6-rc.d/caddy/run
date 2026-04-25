@@ -1,0 +1,25 @@
+#!/command/with-contenv bash
+# Caddy front-door longrun.
+#
+# Listens on 0.0.0.0:8080 (the `port` declared in openhost.toml). Routes
+# /api/v1/streaming/* to the node streaming server on :4000 and every
+# other request to puma on :3000. Rewrites the Host header from
+# X-Forwarded-Host so Mastodon's CSRF check sees the public hostname
+# rather than 127.0.0.1.
+#
+# Caddy doesn't need root for the unprivileged 8080 bind; we drop to
+# the `caddy` user the apt package installs.
+set -eu
+
+# Caddy keeps its config cache + auto-cert dir under $XDG_CONFIG_HOME and
+# $XDG_DATA_HOME. We override both to point at writable locations under
+# OPENHOST_APP_TEMP_DIR — Caddy doesn't need the certs (TLS terminates
+# at the OpenHost router) but it still tries to provision a default
+# directory and complains noisily if it can't.
+export XDG_CONFIG_HOME="${OPENHOST_APP_TEMP_DIR:-/tmp}/caddy-config"
+export XDG_DATA_HOME="${OPENHOST_APP_TEMP_DIR:-/tmp}/caddy-data"
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
+chown -R caddy:caddy "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
+
+exec s6-setuidgid caddy \
+    /usr/bin/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile

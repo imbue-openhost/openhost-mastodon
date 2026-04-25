@@ -1,0 +1,30 @@
+#!/command/with-contenv bash
+# Mastodon web (Puma) longrun.
+#
+# By the time this fires, bootstrap.sh has confirmed db:migrate is up
+# to date, the admin user exists, and the secrets file at
+# $OPENHOST_APP_DATA_DIR/mastodon-secrets.env has been generated and
+# loaded into the s6 container_environment by secrets-init.sh.
+#
+# Puma binds 127.0.0.1:3000 — Caddy is the only thing that talks to
+# it. We never expose Puma to the OpenHost router directly.
+set -eu
+
+cd /opt/mastodon
+
+# Source the persisted secrets file. We want the failure mode "secrets
+# missing" to be loud: bootstrap is supposed to have written it.
+SECRETS_FILE="${OPENHOST_APP_DATA_DIR:-/data/app_data/mastodon}/mastodon-secrets.env"
+if [[ ! -f "$SECRETS_FILE" ]]; then
+    echo "[mastodon-web] FATAL: secrets file missing: $SECRETS_FILE" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+set -a; source "$SECRETS_FILE"; set +a
+
+# Stay on loopback so Caddy is the only ingress.
+export BIND=127.0.0.1
+export PORT=3000
+
+exec s6-setuidgid mastodon \
+    /usr/local/bin/bundle exec puma -C /opt/mastodon/config/puma.rb

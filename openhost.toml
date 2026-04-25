@@ -1,0 +1,51 @@
+[app]
+name = "mastodon"
+version = "0.1.0"
+description = "Mastodon — federated microblogging. Bundles postgres, redis, puma, sidekiq, streaming, and Caddy in a single container under s6-overlay."
+
+[runtime.container]
+image = "Dockerfile"
+# Caddy front-door inside the container. Caddy fans out to puma (3000)
+# and the streaming server (4000); see Caddyfile.
+port = 8080
+
+[routing]
+# Mastodon serves /health on Puma; Caddy passes that through to it
+# unmodified.
+health_check = "/health"
+# ALL paths must be public. Mastodon federates with the wider fediverse
+# — federation requests come from random remote Mastodon instances over
+# /api/v1, /inbox, /.well-known/webfinger, etc. and must not hit the
+# OpenHost owner-auth gate. The web UI itself is also public (login is
+# Mastodon's own session/cookie auth on top).
+public_paths = ["/"]
+
+[resources]
+# Five processes (postgres, redis, puma, sidekiq, node-streaming) plus
+# Caddy in one container. Empirical floor for a small instance with a
+# single user posting and federating with a handful of peers is around
+# 2.5 GB; 3 GB gives a little headroom for sidekiq enqueue spikes when
+# media transcodes hit at the same time as a federation flood.
+memory_mb = 3072
+cpu_millicores = 2000
+
+[data]
+# Persistent state lives under $OPENHOST_APP_DATA_DIR:
+#   postgres/            — PGDATA (postgres 15 cluster, initdb'd on
+#                          first boot, backed up across redeploys)
+#   redis/               — Redis RDB snapshots
+#   mastodon-uploads/    — paperclip media (avatars, attachments,
+#                          custom emoji). Bind-mounted at runtime onto
+#                          /opt/mastodon/public/system.
+#   mastodon-secrets.env — generated once on first boot. Contains
+#                          SECRET_KEY_BASE, OTP_SECRET, the VAPID
+#                          keypair, and the auto-generated postgres
+#                          password. Never re-generated; cycling these
+#                          would invalidate every existing session and
+#                          break web-push notifications.
+#   admin-password.txt   — printed by `tootctl accounts create` on
+#                          first boot. Contains the bootstrap admin
+#                          credentials. Read once and rotate.
+app_data = true
+# Per-boot scratch (Rails tmp/, sidekiq pids, postgres socket dir).
+app_temp_data = true

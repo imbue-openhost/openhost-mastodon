@@ -1,0 +1,33 @@
+#!/command/with-contenv bash
+# PostgreSQL longrun service.
+#
+# PGDATA points at the persistent directory under
+# $OPENHOST_APP_DATA_DIR/postgres which is initialised by the
+# `pg-init` cont-init script on first boot (see /etc/s6-overlay/scripts).
+# By the time this runs, the data directory is guaranteed to exist and
+# be initdb'd.
+#
+# We `exec` postgres directly (no wrapper) so s6 supervises the actual
+# server process and signals/restarts it correctly. The socket directory
+# is /var/run/postgresql which the unix_socket_directories postgres.conf
+# default points at; Mastodon connects via that local socket
+# (DB_HOST=/var/run/postgresql).
+set -eu
+
+PGDATA="${PGDATA:-/data/app_data/mastodon/postgres}"
+
+# Ensure runtime dirs exist with the right ownership. They live on
+# tmpfs under OpenHost so they don't survive reboots.
+mkdir -p /var/run/postgresql
+chown postgres:postgres /var/run/postgresql
+chmod 2775 /var/run/postgresql
+
+# Postgres refuses to start as root. s6-setuidgid drops to the postgres
+# user before exec'ing.
+exec s6-setuidgid postgres \
+    /usr/lib/postgresql/15/bin/postgres \
+        -D "$PGDATA" \
+        -c config_file="$PGDATA/postgresql.conf" \
+        -c hba_file="$PGDATA/pg_hba.conf" \
+        -c unix_socket_directories=/var/run/postgresql \
+        -c listen_addresses=127.0.0.1

@@ -1,0 +1,26 @@
+#!/command/with-contenv bash
+# Mastodon sidekiq (background workers) longrun.
+#
+# Sidekiq does federation deliveries, media processing, push
+# notifications, scheduled cleanups. Without sidekiq the instance is
+# functional but cannot send anything to the fediverse.
+#
+# Concurrency 5 is the upstream default (config/sidekiq.yml). With our
+# 3 GB memory budget shared across postgres + redis + puma + node we
+# can't realistically run more workers without hitting OOM under bursty
+# federation load.
+set -eu
+
+cd /opt/mastodon
+
+SECRETS_FILE="${OPENHOST_APP_DATA_DIR:-/data/app_data/mastodon}/mastodon-secrets.env"
+if [[ ! -f "$SECRETS_FILE" ]]; then
+    echo "[mastodon-sidekiq] FATAL: secrets file missing: $SECRETS_FILE" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+set -a; source "$SECRETS_FILE"; set +a
+
+# Sidekiq doesn't listen on a port itself.
+exec s6-setuidgid mastodon \
+    /usr/local/bin/bundle exec sidekiq -c 5
