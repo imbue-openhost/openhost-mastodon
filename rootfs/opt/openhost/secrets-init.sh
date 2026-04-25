@@ -171,30 +171,33 @@ RUBY
 fi
 
 # Read back the file (whether we just wrote it or it already existed)
-# and stamp every variable into the s6 container_environment so every
-# downstream service inherits them via with-contenv.
+# and stamp every variable into /run/s6/container_environment so any
+# service started via `with-contenv` inherits them.
 #
-# This is the s6-overlay v3 way of doing `set -a; source` for service
-# scripts: write each name/value as a file under
-# /run/s6/container_environment.
+# We do NOT `source` the file. Bootstrap.sh appends a runtime block to
+# this same file with values like `SMTP_FROM_ADDRESS="Mastodon <...>"`
+# that contain shell metacharacters; even with proper quoting, parse
+# errors elsewhere in the file would abort the whole sourcing and
+# prevent us from stamping the secrets. Instead we walk the file
+# line-by-line, picking out only the names we care about.
 CENV=/run/s6/container_environment
 mkdir -p "$CENV"
-# shellcheck disable=SC2046
-set -a
-# shellcheck disable=SC1090
-source "$SECRETS_FILE"
-set +a
+extract_secret() {
+    # First match wins. The regex tolerates either quoted or unquoted
+    # values: `NAME=value`, `NAME="value"`, `NAME='value'`. We strip
+    # surrounding quotes after matching.
+    local name="$1"
+    grep -E "^${name}=" "$SECRETS_FILE" | head -n1 \
+        | sed -E "s/^${name}=//; s/^[\"']//; s/[\"']\$//"
+}
 
-# Stamp each var. We deliberately enumerate (rather than reading the
-# file again) so a typo in $SECRETS_FILE manifests as a missing var
-# rather than silently passing through whatever happens to be in env.
 for var in SECRET_KEY_BASE OTP_SECRET \
            VAPID_PRIVATE_KEY VAPID_PUBLIC_KEY \
            ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY \
            ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY \
            ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT \
            POSTGRES_PASSWORD; do
-    val="${!var:-}"
+    val="$(extract_secret "$var")"
     if [[ -z "$val" ]]; then
         log "FATAL: $var missing from $SECRETS_FILE"
         exit 1

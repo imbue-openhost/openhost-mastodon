@@ -90,22 +90,28 @@ fi
 
 DATABASE_URL_VAL="postgresql:///mastodon?host=/var/run/postgresql&user=mastodon"
 
+# All values are double-quoted because at least one (SMTP_FROM_ADDRESS,
+# which contains literal `<...>`) would be interpreted as shell I/O
+# redirection by `set -a; source $SECRETS_FILE` otherwise. The simple
+# rule: every value goes between double quotes, and if a value ever
+# legitimately contains a double quote we'd backslash-escape it. None
+# of these values do.
 cat >> "$SECRETS_FILE" <<EOF
 $RUNTIME_MARKER
-LOCAL_DOMAIN=$LOCAL_DOMAIN_VAL
-WEB_DOMAIN=$LOCAL_DOMAIN_VAL
-DATABASE_URL=$DATABASE_URL_VAL
-REDIS_URL=redis://127.0.0.1:6379
-DB_HOST=/var/run/postgresql
-DB_USER=mastodon
-DB_NAME=mastodon
-DB_PORT=5432
-SMTP_DELIVERY_METHOD=test
-SMTP_FROM_ADDRESS=Mastodon <notifications@$LOCAL_DOMAIN_VAL>
-DEFAULT_LOCALE=en
-RAILS_ENV=production
-NODE_ENV=production
-TRUST_ALL_PROXIES=true
+LOCAL_DOMAIN="$LOCAL_DOMAIN_VAL"
+WEB_DOMAIN="$LOCAL_DOMAIN_VAL"
+DATABASE_URL="$DATABASE_URL_VAL"
+REDIS_URL="redis://127.0.0.1:6379"
+DB_HOST="/var/run/postgresql"
+DB_USER="mastodon"
+DB_NAME="mastodon"
+DB_PORT="5432"
+SMTP_DELIVERY_METHOD="test"
+SMTP_FROM_ADDRESS="Mastodon <notifications@$LOCAL_DOMAIN_VAL>"
+DEFAULT_LOCALE="en"
+RAILS_ENV="production"
+NODE_ENV="production"
+TRUST_ALL_PROXIES="true"
 EOF
 
 # Re-source so the rest of THIS script sees these too.
