@@ -36,101 +36,138 @@ SECRETS_FILE="$PERSIST/mastodon-secrets.env"
 
 mkdir -p "$PERSIST"
 
-if [[ -s "$SECRETS_FILE" ]]; then
+# A previous container start may have written a *partial* secrets file
+# and crashed before completing — that leaves us with a file that exists
+# but is missing keys, and on every subsequent boot we'd reuse it and
+# fail. Validate before reusing: the file must have all eight expected
+# names, otherwise we throw it away and regenerate. The validation list
+# matches the loop at the bottom of this script.
+validate_secrets_file() {
+    local f="$1"
+    [[ -s "$f" ]] || return 1
+    for name in SECRET_KEY_BASE OTP_SECRET \
+                VAPID_PRIVATE_KEY VAPID_PUBLIC_KEY \
+                ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY \
+                ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY \
+                ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT \
+                POSTGRES_PASSWORD; do
+        # `^NAME=.+` — non-empty value. The grep -E pattern is anchored
+        # because we don't want a substring match (an entry that was
+        # accidentally renamed `EXTRA_VAPID_PRIVATE_KEY=foo` shouldn't
+        # validate as `VAPID_PRIVATE_KEY`).
+        if ! grep -qE "^${name}=.+" "$f"; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+if validate_secrets_file "$SECRETS_FILE"; then
     log "secrets already exist at $SECRETS_FILE; reusing"
 else
-    log "generating new secrets at $SECRETS_FILE"
+    if [[ -e "$SECRETS_FILE" ]]; then
+        log "existing secrets file at $SECRETS_FILE is incomplete; regenerating"
+        # Move the partial out of the way so an operator can recover it
+        # if they need to (e.g. the partial held the *real* SECRET_KEY_BASE
+        # of an existing deploy and we'd otherwise lose all sessions).
+        mv "$SECRETS_FILE" "$SECRETS_FILE.partial.$(date +%s)"
+    fi
+    log "generating new secrets"
 
-    # Use openssl for a self-contained generation that doesn't require
-    # the Ruby runtime to be ready (we run before any Rails process).
-    # `bundle exec rake secret` and `mastodon:webpush:generate_vapid_key`
-    # are the canonical generators, but they boot the full Rails app
-    # which takes 20+ seconds. Doing it this way at first boot saves a
-    # significant chunk of cold-start time.
-    rand_hex() { openssl rand -hex "$1"; }
-
-    # Mastodon's rake secret outputs a 128-character hex string (64
-    # bytes). Match that exactly.
-    SECRET_KEY_BASE_VAL=$(rand_hex 64)
-    OTP_SECRET_VAL=$(rand_hex 64)
-
-    # ActiveRecord's built-in encrypted attributes (Rails 7+, used by
-    # Mastodon for OTP secrets and a few other columns). Each is a
-    # 32-byte (64-hex-char) random value per Rails docs.
-    AR_PRIMARY=$(rand_hex 16)
-    AR_DETERMINISTIC=$(rand_hex 16)
-    AR_SALT=$(rand_hex 16)
-
-    # VAPID is an ECDSA P-256 keypair. Mastodon's
-    # `mastodon:webpush:generate_vapid_key` rake task uses the
-    # `webpush` gem which calls OpenSSL under the hood to mint a P-256
-    # key and base64url-encode the raw scalar (private) and uncompressed
-    # point (public). We replicate that here without needing Ruby.
+    # All hex/base64 generation goes through Ruby. The Mastodon image's
+    # ruby is in /usr/local/bin/ruby — we use it directly (no bundle exec
+    # needed; OpenSSL + SecureRandom are stdlib). This is more
+    # self-contained than chaining openssl + xxd + base64 + sed in shell,
+    # and exactly mirrors what `rake secret` and the webpush gem do.
     #
-    # Steps:
-    #  1. openssl ecparam -genkey -name prime256v1 -noout -outform PEM
-    #  2. extract the 32-byte private scalar via `openssl ec -text`
-    #  3. extract the 65-byte uncompressed public point the same way
-    #  4. base64-url-encode (no padding) both
-    TMP_PEM=$(mktemp)
-    trap 'rm -f "$TMP_PEM"' EXIT
-
-    openssl ecparam -genkey -name prime256v1 -noout -outform PEM > "$TMP_PEM"
-
-    # Pull the hex-encoded private scalar and public point out of
-    # `openssl ec -text`. Output looks like:
-    #     priv:
-    #         00:aa:bb:...
-    #     pub:
-    #         04:cc:dd:...
-    EC_TEXT=$(openssl ec -in "$TMP_PEM" -text -noout 2>/dev/null)
-
-    # Strip leading 00 (ASN.1 sign byte) on the private scalar if
-    # present. Bash awk dance: lines between "priv:" and "pub:" exclusive.
-    PRIV_HEX=$(echo "$EC_TEXT" \
-        | awk '/priv:/{flag=1; next} /pub:/{flag=0} flag {print}' \
-        | tr -d ' :\n')
-    # OpenSSL emits a leading 00 if the high bit of the scalar is set
-    # (DER ASN.1 INTEGER sign byte). Drop it so we always have exactly
-    # 64 hex chars / 32 bytes.
-    if [[ ${#PRIV_HEX} -eq 66 && "$PRIV_HEX" == 00* ]]; then
-        PRIV_HEX="${PRIV_HEX:2}"
+    # Output format: one VAR=value per line on stdout. We capture the
+    # whole block, validate it has all expected names, then write
+    # atomically (tempfile + mv) so a crash mid-write can never leave a
+    # partial file behind.
+    RUBY=/usr/local/bin/ruby
+    if ! command -v "$RUBY" >/dev/null 2>&1; then
+        # Fall back to `ruby` on PATH if /usr/local/bin/ruby moved.
+        RUBY=$(command -v ruby) || {
+            log "FATAL: no ruby interpreter found (looked for /usr/local/bin/ruby and \$PATH ruby)"
+            exit 1
+        }
     fi
 
-    PUB_HEX=$(echo "$EC_TEXT" \
-        | awk '/pub:/{flag=1; next} /ASN1 OID:|NIST CURVE:/{flag=0} flag {print}' \
-        | tr -d ' :\n')
+    # Heredoc to ruby. `securerandom.hex(64)` matches what `rake secret`
+    # outputs (a 128-char hex string, 64 bytes of entropy). VAPID is an
+    # ECDSA P-256 keypair; we extract the raw 32-byte scalar (private)
+    # and 65-byte uncompressed point (public) and base64-url encode both
+    # without padding, exactly matching the webpush gem's serialisation
+    # at github.com/zaru/webpush/blob/v3.0/lib/webpush/vapid_key.rb
+    NEW_SECRETS=$("$RUBY" <<'RUBY'
+require 'securerandom'
+require 'openssl'
+require 'base64'
 
-    # base64url encode (RFC 4648 §5): swap +/ with -_, drop padding.
-    b64url() {
-        # xxd reverses hex → raw bytes. Then base64 with -w 0 (no
-        # wrap), then character-class swap, then strip trailing =.
-        xxd -r -p | base64 -w 0 | tr '+/' '-_' | tr -d '='
-    }
-    VAPID_PRIVATE_KEY_VAL=$(printf '%s' "$PRIV_HEX" | b64url)
-    VAPID_PUBLIC_KEY_VAL=$(printf '%s' "$PUB_HEX"  | b64url)
+def b64url(bytes)
+  Base64.urlsafe_encode64(bytes).delete('=')
+end
 
-    # Postgres password (random; only used if DATABASE_URL ever switches
-    # to TCP auth or the Rails console connects via host: localhost).
-    POSTGRES_PASSWORD_VAL=$(rand_hex 24)
+# 64-byte hex = 128 chars. Mastodon's rake secret emits this format.
+puts "SECRET_KEY_BASE=#{SecureRandom.hex(64)}"
+puts "OTP_SECRET=#{SecureRandom.hex(64)}"
+# Rails 7 ActiveRecord encryption: 32-char hex (16 bytes raw) per
+# guides.rubyonrails.org/active_record_encryption.html.
+puts "ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY=#{SecureRandom.hex(16)}"
+puts "ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY=#{SecureRandom.hex(16)}"
+puts "ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT=#{SecureRandom.hex(16)}"
+# Postgres password — used as a fallback if Mastodon ever connects via
+# TCP. The local-socket path uses trust auth set up by pg-init.
+puts "POSTGRES_PASSWORD=#{SecureRandom.hex(24)}"
 
+# VAPID keypair (ECDSA P-256). The webpush gem writes:
+#   private_key: base64url(big-endian bytes of the integer d)
+#   public_key:  base64url(0x04 || X || Y)  -- uncompressed point, 65 bytes
+key = OpenSSL::PKey::EC.generate('prime256v1')
+priv_bn = key.private_key
+# `to_s(2)` returns the raw big-endian magnitude. Pad to 32 bytes if
+# the integer happened to be small (extremely rare for cryptographic
+# random keys but cheap insurance — webpush expects exactly 32 bytes).
+priv_bytes = priv_bn.to_s(2).rjust(32, "\x00".b)
+pub_bytes  = key.public_key.to_octet_string(:uncompressed)
+
+puts "VAPID_PRIVATE_KEY=#{b64url(priv_bytes)}"
+puts "VAPID_PUBLIC_KEY=#{b64url(pub_bytes)}"
+RUBY
+)
+
+    # Validate the captured block contains every name we'll insist on
+    # below. If ruby errored in the middle of the heredoc, the catch is
+    # here.
+    for name in SECRET_KEY_BASE OTP_SECRET \
+                VAPID_PRIVATE_KEY VAPID_PUBLIC_KEY \
+                ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY \
+                ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY \
+                ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT \
+                POSTGRES_PASSWORD; do
+        if ! grep -qE "^${name}=.+" <<<"$NEW_SECRETS"; then
+            log "FATAL: ruby secret generator did not emit $name"
+            log "Output was:"
+            echo "$NEW_SECRETS" >&2
+            exit 1
+        fi
+    done
+
+    # Atomic write: tempfile in the same directory (so mv is rename,
+    # not copy), then mv into place. A crash between the tempfile
+    # write and the rename leaves the previous (or no) file untouched.
+    TMP_FILE="$SECRETS_FILE.tmp.$$"
     umask 077
-    cat > "$SECRETS_FILE" <<EOF
-# openhost-mastodon persistent secrets — DO NOT EDIT BY HAND.
-# Regenerating these invalidates every existing session cookie and
-# orphans every web-push subscription on every browser. The instance
-# will keep working but federation handshakes that depend on the
-# stored OAuth client secrets will need to be re-issued.
-SECRET_KEY_BASE=$SECRET_KEY_BASE_VAL
-OTP_SECRET=$OTP_SECRET_VAL
-VAPID_PRIVATE_KEY=$VAPID_PRIVATE_KEY_VAL
-VAPID_PUBLIC_KEY=$VAPID_PUBLIC_KEY_VAL
-ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY=$AR_PRIMARY
-ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY=$AR_DETERMINISTIC
-ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT=$AR_SALT
-POSTGRES_PASSWORD=$POSTGRES_PASSWORD_VAL
-EOF
-    chmod 0600 "$SECRETS_FILE"
+    {
+        echo "# openhost-mastodon persistent secrets — DO NOT EDIT BY HAND."
+        echo "# Regenerating these invalidates every existing session cookie and"
+        echo "# orphans every web-push subscription on every browser. The instance"
+        echo "# will keep working but federation handshakes that depend on the"
+        echo "# stored OAuth client secrets will need to be re-issued."
+        echo "$NEW_SECRETS"
+    } > "$TMP_FILE"
+    chmod 0600 "$TMP_FILE"
+    mv "$TMP_FILE" "$SECRETS_FILE"
 fi
 
 # Read back the file (whether we just wrote it or it already existed)
