@@ -45,6 +45,22 @@
 }
 
 :8080 {
+	# Set a virtual {forwarded_host} variable that prefers
+	# X-Forwarded-Host (set by the OpenHost router) and falls back to
+	# the inbound Host (covers local smoke tests and the rare router
+	# liveness probe that doesn't bother stamping XFH). This makes
+	# every header_up Host below point at *something* — Caddy v2's
+	# placeholder evaluation collapses an absent header into literal
+	# "", which Mastodon would then reject as Host mismatch / CSRF
+	# failure / federation Signature mismatch (the inbound Signature
+	# header from a remote ActivityPub server is computed against the
+	# original Host).
+	vars forwarded_host {http.request.header.X-Forwarded-Host}
+	@no_xfh `{vars.forwarded_host} == ""`
+	handle @no_xfh {
+		vars forwarded_host {http.request.host}
+	}
+
 	# Streaming: long-lived WebSocket + SSE connections to the node
 	# server. Order matters here — Caddy matches in the order written.
 	@streaming path /api/v1/streaming /api/v1/streaming/*
@@ -54,7 +70,7 @@
 			# hostname. Streaming itself doesn't enforce a Host
 			# match (it's an API, not a CSRF-protected form),
 			# but keeping things consistent helps debugging.
-			header_up Host {http.request.header.X-Forwarded-Host}
+			header_up Host {vars.forwarded_host}
 			# WebSocket connections idle long. 24h matches the
 			# upstream nginx config that ships with Mastodon's
 			# deployment guide.
@@ -71,7 +87,14 @@
 	# `header_up Host` is the critical fix: without it, puma sees
 	# `Host: 127.0.0.1:3000` and Rails' CSRF middleware refuses every
 	# state-changing request with InvalidAuthenticityToken because the
-	# computed origin doesn't match LOCAL_DOMAIN.
+	# computed origin doesn't match LOCAL_DOMAIN. We also use it for
+	# inbound ActivityPub deliveries: a remote Mastodon instance signs
+	# its delivery with its own private key over the request line +
+	# (Host) header; if Caddy passes a different Host upstream than
+	# what the remote server signed, our HTTP Signature verification
+	# fails and the delivery is rejected with 401. Using
+	# {vars.forwarded_host} (which falls back to the inbound Host
+	# when X-Forwarded-Host is missing) keeps both flows working.
 	#
 	# `header_up X-Forwarded-Proto https` is hardcoded because the
 	# OpenHost router only ever fronts public apps over TLS — the
@@ -85,7 +108,7 @@
 	# to "https" here side-steps the placeholder semantics entirely.
 	handle {
 		reverse_proxy 127.0.0.1:3000 {
-			header_up Host {http.request.header.X-Forwarded-Host}
+			header_up Host {vars.forwarded_host}
 			header_up X-Forwarded-Proto https
 			# Fail fast on slow upstream — we'd rather return a
 			# 502 to the OpenHost router so the front-door can

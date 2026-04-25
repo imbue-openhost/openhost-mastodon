@@ -138,7 +138,11 @@ RUBY
 
     # Validate the captured block contains every name we'll insist on
     # below. If ruby errored in the middle of the heredoc, the catch is
-    # here.
+    # here. We deliberately do NOT echo $NEW_SECRETS to stderr on
+    # validation failure — it contains every successfully-generated
+    # cryptographic secret, and container stderr is collected by the
+    # OpenHost log aggregator and persisted to disk. Logging just the
+    # missing key name is enough to debug.
     for name in SECRET_KEY_BASE OTP_SECRET \
                 VAPID_PRIVATE_KEY VAPID_PUBLIC_KEY \
                 ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY \
@@ -146,9 +150,10 @@ RUBY
                 ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT \
                 POSTGRES_PASSWORD; do
         if ! grep -qE "^${name}=.+" <<<"$NEW_SECRETS"; then
-            log "FATAL: ruby secret generator did not emit $name"
-            log "Output was:"
-            echo "$NEW_SECRETS" >&2
+            log "FATAL: ruby secret generator did not emit $name (re-run with bash -x to debug)"
+            # Also clear the local copy of $NEW_SECRETS so it doesn't
+            # linger in the script's process memory longer than needed.
+            unset NEW_SECRETS
             exit 1
         fi
     done
@@ -156,7 +161,12 @@ RUBY
     # Atomic write: tempfile in the same directory (so mv is rename,
     # not copy), then mv into place. A crash between the tempfile
     # write and the rename leaves the previous (or no) file untouched.
+    # Trap rm so a script-level abort (chmod failure, signal during
+    # write, etc.) cleans up the temp file rather than leaving plaintext
+    # cryptographic material on disk under a predictable filename.
     TMP_FILE="$SECRETS_FILE.tmp.$$"
+    cleanup_tmp() { rm -f "$TMP_FILE"; }
+    trap cleanup_tmp EXIT INT TERM
     umask 077
     {
         echo "# openhost-mastodon persistent secrets — DO NOT EDIT BY HAND."
@@ -168,6 +178,10 @@ RUBY
     } > "$TMP_FILE"
     chmod 0600 "$TMP_FILE"
     mv "$TMP_FILE" "$SECRETS_FILE"
+    # Disarm the trap now that the temp file has been renamed (so the
+    # destination file the operator wants is what survives).
+    trap - EXIT INT TERM
+    unset NEW_SECRETS
 fi
 
 # Read back the file (whether we just wrote it or it already existed)

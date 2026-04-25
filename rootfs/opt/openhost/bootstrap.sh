@@ -1,15 +1,23 @@
 #!/command/with-contenv bash
 # bootstrap: oneshot that runs after postgres + redis are up and after
-# secrets-init has stamped persistent secrets into container_environment.
+# secrets-init has generated/loaded persistent secrets.
 #
 # Responsibilities (idempotent — safe to run on every boot):
 #   1. Derive LOCAL_DOMAIN / WEB_DOMAIN from OpenHost env vars and
-#      stamp them into container_environment so puma + sidekiq +
-#      streaming all see the same value. **Federation identity is
-#      permanent** — once Mastodon has handshaken with any remote
-#      server using this domain, it cannot be changed without breaking
-#      every existing federation handshake. We commit to the OpenHost
-#      app subdomain on first boot and never look back.
+#      append them (along with DATABASE_URL, REDIS_URL, SMTP_*, and
+#      the rest of the Mastodon runtime config) to the
+#      $OPENHOST_APP_DATA_DIR/mastodon-secrets.env file. The three
+#      Mastodon longruns (web, sidekiq, streaming) source that file
+#      at exec time, so this is how we get config to them — we do
+#      not write to /run/s6/container_environment because the
+#      `with-contenv` reads happen at unpredictable times during
+#      stage 2 and any value we'd add wouldn't reliably reach a
+#      longrun whose run script doesn't already source the secrets
+#      file. **Federation identity is permanent** — once Mastodon
+#      has handshaken with any remote server using this domain, it
+#      cannot be changed without breaking every existing federation
+#      handshake. We commit to the OpenHost app subdomain on first
+#      boot and never look back.
 #   2. Bind-mount $OPENHOST_APP_DATA_DIR/mastodon-uploads onto
 #      /opt/mastodon/public/system so paperclip writes (avatars,
 #      attachments, custom emoji) survive container redeploys.
@@ -242,10 +250,14 @@ cd /opt/mastodon
 
 # We pass every Mastodon-required env var explicitly to env(1) so the
 # subshell sees them whether or not s6's container_environment has
-# propagated yet. (set -a + source above already exported them, but
-# `s6-setuidgid` reset HOME — Ruby's bundler then complains that /root
-# isn't writable. The HOME=/tmp override fixes that.)
-mastodon_run_rake() {
+# propagated yet. (set -a + source above already exported them.)
+# Generic helper to run any command as the mastodon user with a clean
+# Mastodon environment. Used for `rails db:migrate`, `rails db:seed`,
+# and `tootctl accounts create`. The mastodon user has no real $HOME
+# under s6-setuidgid (it inherits root's `/root` which it can't write
+# to), so we explicitly set HOME=/tmp before exec — Bundler creates
+# .bundle/ in HOME and crashes without a writable HOME.
+mastodon_run() {
     s6-setuidgid mastodon env \
         HOME=/tmp \
         LOCAL_DOMAIN="$LOCAL_DOMAIN" WEB_DOMAIN="$WEB_DOMAIN" \
@@ -262,7 +274,7 @@ mastodon_run_rake() {
         "$@"
 }
 
-mastodon_run_rake /usr/local/bin/bundle exec rails db:migrate
+mastodon_run /usr/local/bin/bundle exec rails db:migrate
 
 # `db:seed` populates the default UserRole rows (Owner, Admin, Moderator)
 # and is required for tootctl to create users with --role Owner. It is
@@ -273,7 +285,7 @@ mastodon_run_rake /usr/local/bin/bundle exec rails db:migrate
 # whether the seed actually inserts anything, and we already paid that
 # cost for db:migrate. Run it unconditionally.
 log "running db:seed (idempotent)"
-mastodon_run_rake /usr/local/bin/bundle exec rails db:seed
+mastodon_run /usr/local/bin/bundle exec rails db:seed
 
 # ----- 6. bootstrap admin user (first boot only) ------------------------
 #
@@ -296,7 +308,7 @@ else
     # `--role Owner` grants the highest permission level (Mastodon's
     # built-in role hierarchy: User < Moderator < Admin < Owner).
     set +e
-    TOOTCTL_OUTPUT=$(mastodon_run_rake /opt/mastodon/bin/tootctl accounts create "$ADMIN_USER" \
+    TOOTCTL_OUTPUT=$(mastodon_run /opt/mastodon/bin/tootctl accounts create "$ADMIN_USER" \
             --email "$ADMIN_EMAIL" \
             --confirmed \
             --role Owner 2>&1)

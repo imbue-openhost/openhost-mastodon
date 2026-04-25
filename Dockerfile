@@ -72,10 +72,16 @@ RUN apt-get update \
 # header from X-Forwarded-Host so Mastodon sees the public hostname (the
 # OpenHost router strips Host on the way through).
 #
-# We don't use cloudsmith's bundled debian.deb.txt because it hardcodes
-# the keyring path /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-# while we want the key file in /etc/apt/keyrings (modern Debian
-# convention). Easier to just write the .list ourselves.
+# We write the .list file ourselves rather than `curl ... | tee
+# /etc/apt/sources.list.d/caddy.list` (which is what cloudsmith's
+# debian.deb.txt-style installer does) because we want a single
+# Debian dist that doesn't change shape between Debian releases —
+# cloudsmith's bundled file uses the architecture's `lsb_release -cs`
+# value, which on trixie evaluates to literal "trixie" but is empty
+# inside our build sandbox where lsb-release is not yet installed.
+# Hardcoding `any-version` is the dist Caddy publishes for all Debian
+# versions and matches what cloudsmith's deb-helper installs anyway.
+# The keyring path is the standard one cloudsmith expects.
 RUN install -d -m 0755 /usr/share/keyrings \
  && curl -1sSLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
         | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg \
