@@ -10,9 +10,11 @@ container supervised by [s6-overlay v3](https://github.com/just-containers/s6-ov
 ## TL;DR
 
 Deploy via the OpenHost router. Once it's up, the admin password is in
-`$OPENHOST_APP_DATA_DIR/admin-password.txt` inside the container — read
-it via the OpenHost terminal, log in at `https://mastodon.<your-zone>`,
-and start posting.
+`$OPENHOST_APP_DATA_DIR/admin-password.txt` *inside the container*. The
+simplest way to read it is `podman exec` from the OpenHost system
+terminal — see [Logging in as admin](#logging-in-as-admin) for the
+exact command. Then log in at `https://mastodon.<your-zone>` and
+start posting.
 
 ## ⚠ Caveats — read these before deploying
 
@@ -153,26 +155,79 @@ Everything in here is on the OpenHost-backed-up volume.
 
 ## Logging in as admin
 
-After the first boot, find the password:
+The bootstrap script writes the admin password to
+`$OPENHOST_APP_DATA_DIR/admin-password.txt` after the first successful
+boot. That env var resolves to `/data/app_data/mastodon/...` *inside
+the container*, but the bind-mounted host path varies per OpenHost
+install (e.g.  `/home/host/.openhost/local_compute_space/persistent_data/app_data/mastodon/`
+on a default Ansible-provisioned VM, somewhere else on a custom
+install). The container's view is always the same, so the
+recommended way to read the file is to exec into the container from
+the OpenHost system terminal:
 
 ```sh
-# Via the OpenHost in-host terminal:
-cat /data/app_data/mastodon/admin-password.txt
+podman exec openhost-mastodon \
+    cat /data/app_data/mastodon/admin-password.txt
 ```
 
-Or, from outside, via the OpenHost API:
+If you prefer to read it from the host directly, find the host path
+once with:
 
 ```sh
-curl -H "Authorization: Bearer $TOKEN" \
-     https://<your-host>/app_logs/mastodon | grep -A4 'admin user created'
+podman inspect openhost-mastodon \
+    --format '{{ range .Mounts }}{{ if eq .Destination "/data/app_data/mastodon" }}{{ .Source }}{{ end }}{{ end }}'
 ```
+
+and `cat $THAT_PATH/admin-password.txt`.
+
+> Note: `GET /app_logs/<app>` does **not** reliably contain the
+> bootstrap script's output. Bootstrap is an s6-overlay oneshot and
+> its stderr is not always plumbed into the same log podman shows
+> for the longruns. Use the file, not the log endpoint.
 
 The username is `operator` (Mastodon reserves `admin` so we use
 `operator` like the openhost-forgejo wrapper does). Log in at
 `https://mastodon.<your-zone>/auth/sign_in` with the email
 `operator@mastodon.<your-zone>` and the printed password. Change the
 password from **Preferences → Account → Change password** on first
-login and rotate the file out of `$OPENHOST_APP_DATA_DIR`.
+login and remove the file from `$OPENHOST_APP_DATA_DIR`.
+
+### What if `admin-password.txt` is missing?
+
+If the file is absent on a running instance, one of two things has
+happened:
+
+1. **The bootstrap is still in progress.** First boot can take 5–10
+   minutes (db:migrate runs ~250 migrations + Rails cold-boot for
+   tootctl). Wait for `app_logs/mastodon` to show puma serving
+   requests, then check again.
+
+2. **The bootstrap is finished and the file was never written.** This
+   was a real bug in earlier builds: the marker file
+   (`.admin-bootstrapped`) could be written even when admin creation
+   silently failed, leaving the instance with no working admin and
+   no auto-retry. Newer builds detect this and write a placeholder
+   `admin-password.txt` containing the recovery instructions, but if
+   you're on an old build the file is just missing.
+
+   To recover, reset the password manually from the OpenHost system
+   terminal:
+
+   ```sh
+   # Try to reset; if the user doesn't exist, fall through to create.
+   podman exec openhost-mastodon \
+       s6-setuidgid mastodon env HOME=/tmp \
+       /opt/mastodon/bin/tootctl accounts modify operator --reset-password \
+   || podman exec openhost-mastodon \
+       s6-setuidgid mastodon env HOME=/tmp \
+       /opt/mastodon/bin/tootctl accounts create operator \
+           --email operator@$LOCAL_DOMAIN \
+           --confirmed --role Owner
+   ```
+
+   tootctl prints the new password to stdout. Log in with it, change
+   it from Preferences → Account → Change password, and you're back
+   in business.
 
 ## Configuration knobs
 

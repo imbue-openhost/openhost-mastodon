@@ -292,66 +292,166 @@ mastodon_run /usr/local/bin/bundle exec rails db:seed
 # `tootctl accounts create` prints a generated password to stdout in
 # the format:  "OK\nNew password: xxxx" — we capture that and stash it
 # under $OPENHOST_APP_DATA_DIR/admin-password.txt for the operator to
-# read once. We use a marker file to guard against re-running and
-# generating a confusing second password the operator might then try
-# to use.
+# read once.
+#
+# Marker policy (this is load-bearing — get it wrong and operators end
+# up with no admin and no auto-retry):
+#
+#   - On clean success (tootctl rc=0 AND password parsed AND file
+#     written) we write the marker so subsequent boots skip this
+#     section. Re-running would either fail (user exists) or, worse,
+#     create a confusing second password.
+#
+#   - If tootctl fails because the user already exists (e.g. an old
+#     buggy build deleted the marker but left the user behind, or the
+#     operator created the user manually), we also write the marker:
+#     retrying won't help, so stop trying. We drop a placeholder
+#     password file that explains the situation and how to reset.
+#
+#   - On any *other* failure (tootctl crashed, db not ready, output
+#     parser couldn't find the password line, etc.) we DO NOT write
+#     the marker. The next boot will retry. This is safe because
+#     tootctl's own duplicate-check covers the case where the user
+#     was actually created on a prior attempt; we'll fall through to
+#     the already-exists branch above.
 ADMIN_MARKER="$PERSIST/.admin-bootstrapped"
 ADMIN_PW_FILE="$PERSIST/admin-password.txt"
 ADMIN_USER="${ADMIN_USERNAME:-operator}"
 ADMIN_EMAIL="${ADMIN_EMAIL:-${ADMIN_USER}@${LOCAL_DOMAIN}}"
 
+write_admin_pw_file() {
+    # $1: password OR empty for the placeholder used by the
+    # already-exists branch.
+    local password="$1"
+    umask 077
+    if [[ -n "$password" ]]; then
+        cat > "$ADMIN_PW_FILE" <<EOF
+Mastodon admin user (created on first boot)
+==========================================
+URL:       https://$LOCAL_DOMAIN
+Username:  $ADMIN_USER
+Email:     $ADMIN_EMAIL
+Password:  $password
+
+Read this once and rotate the password from
+  Preferences → Account → Change password
+after first login.
+
+(File is at \$OPENHOST_APP_DATA_DIR/admin-password.txt; from the
+OpenHost system terminal it lives at
+\$OPENHOST_DATA_ROOT/persistent_data/app_data/mastodon/admin-password.txt.)
+EOF
+    else
+        cat > "$ADMIN_PW_FILE" <<EOF
+Mastodon admin user already exists
+==================================
+URL:       https://$LOCAL_DOMAIN
+Username:  $ADMIN_USER
+Email:     $ADMIN_EMAIL
+
+The bootstrap script could not create this user because it already
+exists in the database, but no first-boot password was ever captured
+to this file (most likely because an earlier buggy bootstrap touched
+the marker file before writing this one).
+
+To recover, reset the password from inside the running container:
+
+    podman exec openhost-mastodon \\
+        s6-setuidgid mastodon env HOME=/tmp \\
+        /opt/mastodon/bin/tootctl accounts modify $ADMIN_USER \\
+            --reset-password
+
+tootctl prints the new password to stdout. After logging in, change
+it from Preferences → Account → Change password.
+EOF
+    fi
+    chmod 0600 "$ADMIN_PW_FILE"
+    chown mastodon:mastodon "$ADMIN_PW_FILE"
+}
+
+# Returns 0 on clean success, 2 if the user already exists, 1 on any
+# other failure. Outputs the captured admin password to stdout on
+# clean success only.
+bootstrap_admin() {
+    local output rc
+    set +e
+    output=$(mastodon_run /opt/mastodon/bin/tootctl accounts create "$ADMIN_USER" \
+            --email "$ADMIN_EMAIL" \
+            --confirmed \
+            --role Owner 2>&1)
+    rc=$?
+    set -e
+
+    if [[ $rc -eq 0 ]]; then
+        # tootctl prints "OK\nNew password: <pw>" on success.
+        local password
+        password=$(echo "$output" | sed -n 's/^New password: //p')
+        if [[ -z "$password" ]]; then
+            log "tootctl returned 0 but did not print a password; full output follows:"
+            echo "$output" >&2
+            return 1
+        fi
+        printf '%s\n' "$password"
+        return 0
+    fi
+
+    # tootctl exited non-zero. Treat "user already exists" as a
+    # distinct, non-retryable outcome. The exact message comes from
+    # ActiveModel validation: "Username has already been taken" or
+    # "Email has already been taken". Either is enough to tell us the
+    # account is in the DB.
+    if echo "$output" | grep -qiE "(Username|Email).*already been taken"; then
+        log "tootctl reports admin user '$ADMIN_USER' already exists"
+        return 2
+    fi
+
+    log "tootctl accounts create failed (exit $rc):"
+    echo "$output" >&2
+    return 1
+}
+
 if [[ -f "$ADMIN_MARKER" ]]; then
     log "admin user already bootstrapped; skipping"
+    # Defend against the legacy buggy path where the marker was
+    # written but the password file never was. Leaving the operator
+    # with neither file is the worst possible outcome — at least give
+    # them a hint they can act on.
+    if [[ ! -f "$ADMIN_PW_FILE" ]]; then
+        log "WARN: $ADMIN_MARKER exists but $ADMIN_PW_FILE is missing."
+        log "WARN: writing a placeholder explaining how to reset the password."
+        write_admin_pw_file ""
+    fi
 else
     log "creating admin user '$ADMIN_USER' (email=$ADMIN_EMAIL)"
     # `--confirmed` skips the email confirmation flow we can't deliver.
     # `--role Owner` grants the highest permission level (Mastodon's
     # built-in role hierarchy: User < Moderator < Admin < Owner).
     set +e
-    TOOTCTL_OUTPUT=$(mastodon_run /opt/mastodon/bin/tootctl accounts create "$ADMIN_USER" \
-            --email "$ADMIN_EMAIL" \
-            --confirmed \
-            --role Owner 2>&1)
-    TOOTCTL_RC=$?
+    NEW_ADMIN_PASSWORD=$(bootstrap_admin)
+    BOOTSTRAP_RC=$?
     set -e
 
-    if [[ $TOOTCTL_RC -ne 0 ]]; then
-        log "tootctl accounts create failed (exit $TOOTCTL_RC):"
-        echo "$TOOTCTL_OUTPUT" >&2
-        # Don't fail bootstrap — maybe the user already exists from a
-        # prior boot whose marker file was lost. The operator can
-        # always run tootctl manually via the OpenHost terminal.
-        log "WARN: continuing without admin bootstrap; create one manually with tootctl if needed"
-    else
-        # tootctl prints "OK\nNew password: <pw>" on success.
-        ADMIN_PASSWORD=$(echo "$TOOTCTL_OUTPUT" | sed -n 's/^New password: //p')
-        if [[ -z "$ADMIN_PASSWORD" ]]; then
-            log "WARN: tootctl returned 0 but didn't print a password; output was:"
-            echo "$TOOTCTL_OUTPUT" >&2
-        else
-            umask 077
-            cat > "$ADMIN_PW_FILE" <<EOF
-Mastodon admin user (created on first boot)
-==========================================
-URL:       https://$LOCAL_DOMAIN
-Username:  $ADMIN_USER
-Email:     $ADMIN_EMAIL
-Password:  $ADMIN_PASSWORD
-
-Read this once and rotate the password from
-  Preferences → Account → Change password
-after first login.
-
-(File is at \$OPENHOST_APP_DATA_DIR/admin-password.txt)
-EOF
-            chmod 0600 "$ADMIN_PW_FILE"
-            chown mastodon:mastodon "$ADMIN_PW_FILE"
+    case "$BOOTSTRAP_RC" in
+        0)
+            write_admin_pw_file "$NEW_ADMIN_PASSWORD"
+            touch "$ADMIN_MARKER"
             log "admin user created; credentials at $ADMIN_PW_FILE"
-        fi
-    fi
-
-    # Mark bootstrap done even if tootctl failed — we've at least tried.
-    touch "$ADMIN_MARKER"
+            ;;
+        2)
+            # User already exists. Stop retrying (marker), explain how
+            # to recover (placeholder password file).
+            write_admin_pw_file ""
+            touch "$ADMIN_MARKER"
+            log "admin already exists; placeholder written to $ADMIN_PW_FILE"
+            ;;
+        *)
+            # Transient or unknown failure: leave the marker absent so
+            # the next bootstrap attempt retries.
+            log "WARN: admin bootstrap failed; will retry on next boot"
+            log "WARN: marker NOT written; password file NOT written"
+            log "WARN: if this persists, run tootctl manually inside the container"
+            ;;
+    esac
 fi
 
 log "bootstrap complete"
