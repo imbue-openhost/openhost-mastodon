@@ -210,24 +210,32 @@ happened:
    `admin-password.txt` containing the recovery instructions, but if
    you're on an old build the file is just missing.
 
-   To recover, reset the password manually from the OpenHost system
-   terminal:
+   To recover, approve the account and reset its password from the
+   OpenHost system terminal. The two are independent — without
+   `accounts approve` you'll log in and immediately land on
+   Mastodon's "Your application is pending review by our staff"
+   page, regardless of whether the password works:
 
    ```sh
-   # Try to reset; if the user doesn't exist, fall through to create.
+   # Approve the account (idempotent if already approved).
    podman exec openhost-mastodon \
-       s6-setuidgid mastodon env HOME=/tmp \
+       /command/s6-setuidgid mastodon env HOME=/tmp \
+       /opt/mastodon/bin/tootctl accounts approve operator
+
+   # Reset password (or create the user if it never existed).
+   podman exec openhost-mastodon \
+       /command/s6-setuidgid mastodon env HOME=/tmp \
        /opt/mastodon/bin/tootctl accounts modify operator --reset-password \
    || podman exec openhost-mastodon \
-       s6-setuidgid mastodon env HOME=/tmp \
+       /command/s6-setuidgid mastodon env HOME=/tmp \
        /opt/mastodon/bin/tootctl accounts create operator \
            --email operator@$LOCAL_DOMAIN \
-           --confirmed --role Owner
+           --confirmed --approve --role Owner
    ```
 
-   tootctl prints the new password to stdout. Log in with it, change
-   it from Preferences → Account → Change password, and you're back
-   in business.
+   tootctl prints the new password to stdout on the second command.
+   Log in with it, change it from Preferences → Account → Change
+   password, and you're back in business.
 
 ## Configuration knobs
 
