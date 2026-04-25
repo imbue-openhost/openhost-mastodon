@@ -70,37 +70,43 @@ fi
 
 echo "$LOCAL_DOMAIN_VAL" > "$DOMAIN_CACHE_FILE"
 
-# Stamp into the s6 container_environment so the longruns see it.
-CENV=/run/s6/container_environment
-mkdir -p "$CENV"
-printf '%s' "$LOCAL_DOMAIN_VAL" > "$CENV/LOCAL_DOMAIN"
-printf '%s' "$LOCAL_DOMAIN_VAL" > "$CENV/WEB_DOMAIN"
+# Append derived runtime config to the secrets file. The three Mastodon
+# longruns (web, sidekiq, streaming) all source the secrets file at
+# exec time, which means we don't have to fight with s6-overlay's
+# `with-contenv` env-propagation timing — whatever's in this file is
+# what the services will see.
+#
+# We rewrite (rather than append) the runtime block on every boot so
+# changes to LOCAL_DOMAIN policy in this script reach the longruns
+# immediately. We use a marker line to find the start of "our" block
+# and truncate from there. The static crypto secrets above the marker
+# are preserved; everything below is rewritten.
+SECRETS_FILE="$PERSIST/mastodon-secrets.env"
+RUNTIME_MARKER="# --- runtime config (regenerated every boot) ---"
+if grep -qF "$RUNTIME_MARKER" "$SECRETS_FILE"; then
+    # Truncate from the marker line onward.
+    sed -i "/^${RUNTIME_MARKER}\$/,\$d" "$SECRETS_FILE"
+fi
 
-# Mastodon's database connection: local unix socket via the postgres
-# user with no password (trust auth on local sockets, set by pg-init).
-# We write DATABASE_URL pointing at the same socket so streaming (which
-# only honours DATABASE_URL, not the DB_* split) connects the same way.
 DATABASE_URL_VAL="postgresql:///mastodon?host=/var/run/postgresql&user=mastodon"
-printf '%s' "$DATABASE_URL_VAL"     > "$CENV/DATABASE_URL"
-printf '%s' "redis://127.0.0.1:6379" > "$CENV/REDIS_URL"
-printf '%s' "mastodon"              > "$CENV/DB_USER"
-printf '%s' "mastodon"              > "$CENV/DB_NAME"
-printf '%s' "/var/run/postgresql"   > "$CENV/DB_HOST"
-printf '%s' "5432"                  > "$CENV/DB_PORT"
 
-# SMTP: configure delivery to /dev/null. Mastodon's mailer must have a
-# valid configuration block to boot but we don't actually want to send
-# email from a test instance. `test` delivery method swallows mail and
-# stashes it in ActionMailer::Base.deliveries (in-process; nobody sees it).
-# This means new-user signups silently fail — there's no confirmation
-# email — so we use tootctl below to create the admin without one.
-printf '%s' "test"                                  > "$CENV/SMTP_DELIVERY_METHOD"
-printf '%s' "Mastodon <notifications@$LOCAL_DOMAIN_VAL>" > "$CENV/SMTP_FROM_ADDRESS"
-printf '%s' "en"                                    > "$CENV/DEFAULT_LOCALE"
-
-# Tell Rails to trust the proxy chain. Caddy + the OpenHost router are
-# both forwarders we control.
-printf '%s' "true" > "$CENV/TRUST_ALL_PROXIES"
+cat >> "$SECRETS_FILE" <<EOF
+$RUNTIME_MARKER
+LOCAL_DOMAIN=$LOCAL_DOMAIN_VAL
+WEB_DOMAIN=$LOCAL_DOMAIN_VAL
+DATABASE_URL=$DATABASE_URL_VAL
+REDIS_URL=redis://127.0.0.1:6379
+DB_HOST=/var/run/postgresql
+DB_USER=mastodon
+DB_NAME=mastodon
+DB_PORT=5432
+SMTP_DELIVERY_METHOD=test
+SMTP_FROM_ADDRESS=Mastodon <notifications@$LOCAL_DOMAIN_VAL>
+DEFAULT_LOCALE=en
+RAILS_ENV=production
+NODE_ENV=production
+TRUST_ALL_PROXIES=true
+EOF
 
 # Re-source so the rest of THIS script sees these too.
 export LOCAL_DOMAIN="$LOCAL_DOMAIN_VAL"
