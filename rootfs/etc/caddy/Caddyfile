@@ -73,18 +73,20 @@
 	# state-changing request with InvalidAuthenticityToken because the
 	# computed origin doesn't match LOCAL_DOMAIN.
 	#
-	# `header_up X-Forwarded-Proto` is set by Caddy automatically from
-	# the inbound request scheme, but the OpenHost router already
-	# terminated TLS — pass through whatever it told us so Mastodon
-	# generates `https://` URLs for federation.
+	# `header_up X-Forwarded-Proto https` is hardcoded because the
+	# OpenHost router only ever fronts public apps over TLS — the
+	# request reaching this Caddy is always HTTPS-from-the-client
+	# even though Caddy itself receives plain HTTP from the router.
+	# Trying to pass through the inbound `X-Forwarded-Proto` ran into
+	# a redirect loop on first deploy: when the header arrived empty
+	# (which Caddy's placeholder evaluates to literal "") puma's
+	# `force_ssl` middleware decided the request was HTTP, redirected
+	# to HTTPS, and the client retried the same URL forever. Pinning
+	# to "https" here side-steps the placeholder semantics entirely.
 	handle {
 		reverse_proxy 127.0.0.1:3000 {
 			header_up Host {http.request.header.X-Forwarded-Host}
-			# Pass through the original X-Forwarded-Proto from
-			# OpenHost (always "https" in production); fall back
-			# to the scheme Caddy saw if the header is absent so
-			# local-only smoke tests still work.
-			header_up X-Forwarded-Proto {http.request.header.X-Forwarded-Proto}
+			header_up X-Forwarded-Proto https
 			# Fail fast on slow upstream — we'd rather return a
 			# 502 to the OpenHost router so the front-door can
 			# retry than tie up a Caddy worker indefinitely.
