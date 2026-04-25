@@ -26,9 +26,13 @@
 #      (trust auth set by pg-init).
 #   4. Run db:migrate (no-op when up to date).
 #   5. On the very first boot, create an admin user via
-#      `tootctl accounts create operator --confirmed --role Owner` and
-#      capture the rake-printed temporary password to
-#      $OPENHOST_APP_DATA_DIR/admin-password.txt.
+#      `tootctl accounts create operator --confirmed --approve --role Owner`
+#      and capture the rake-printed temporary password to
+#      $OPENHOST_APP_DATA_DIR/admin-password.txt. Both --confirmed
+#      and --approve are required: --confirmed skips the SMTP-gated
+#      email-confirmation flow (we have SMTP_DELIVERY_METHOD=test),
+#      and --approve sets users.approved=true so login doesn't dead-
+#      end on Mastodon's "your application is pending review" page.
 #
 # When this script exits 0, the three Mastodon longruns (web, sidekiq,
 # streaming) start in parallel.
@@ -354,15 +358,22 @@ exists in the database, but no first-boot password was ever captured
 to this file (most likely because an earlier buggy bootstrap touched
 the marker file before writing this one).
 
-To recover, reset the password from inside the running container:
+To recover, reset the password and approve the account from inside
+the running container. Both steps are needed: a password alone does
+not let you past Mastodon's "pending review" page if the existing
+account was created without --approve.
 
     podman exec openhost-mastodon \\
-        s6-setuidgid mastodon env HOME=/tmp \\
+        /command/s6-setuidgid mastodon env HOME=/tmp \\
+        /opt/mastodon/bin/tootctl accounts approve $ADMIN_USER
+
+    podman exec openhost-mastodon \\
+        /command/s6-setuidgid mastodon env HOME=/tmp \\
         /opt/mastodon/bin/tootctl accounts modify $ADMIN_USER \\
             --reset-password
 
-tootctl prints the new password to stdout. After logging in, change
-it from Preferences → Account → Change password.
+The second command prints the new password to stdout. After logging
+in, change it from Preferences → Account → Change password.
 EOF
     fi
     chmod 0600 "$ADMIN_PW_FILE"
@@ -375,9 +386,20 @@ EOF
 bootstrap_admin() {
     local output rc
     set +e
+    # `--confirmed` sets users.confirmed_at (skips the email
+    # confirmation we can't deliver since SMTP is unconfigured).
+    # `--approve` sets users.approved=true, which is required for
+    # login to actually proceed past the "pending review" page when
+    # the instance is in (or was ever in) approval-required mode.
+    # tootctl creates accounts with approved=false by default
+    # regardless of --confirmed; the two flags are independent and
+    # we always want both.
+    # `--role Owner` grants the highest permission level (Mastodon's
+    # built-in role hierarchy: User < Moderator < Admin < Owner).
     output=$(mastodon_run /opt/mastodon/bin/tootctl accounts create "$ADMIN_USER" \
             --email "$ADMIN_EMAIL" \
             --confirmed \
+            --approve \
             --role Owner 2>&1)
     rc=$?
     set -e
