@@ -23,26 +23,24 @@
 	# Reduce Caddy's own admin API to localhost only (it's used for
 	# config reloads, which we don't do).
 	admin off
+	# Trust the OpenHost router's X-Forwarded-* headers globally.
+	# `servers` is a global-block-only directive — putting it inside a
+	# site block fails caddyfile adapt with "unrecognized directive".
+	# `client_ip_headers` populates {client_ip} from X-Forwarded-For so
+	# logs reflect the real visitor IP rather than the OpenHost router's
+	# container address. `trusted_proxies private_ranges` accepts any
+	# RFC1918 / loopback / link-local source as a trusted forwarder —
+	# the OpenHost router lives at a private podman bridge address so
+	# this matches it.
+	servers {
+		client_ip_headers X-Forwarded-For
+		trusted_proxies static private_ranges
+	}
 	# Quieter logs in production. Switch to DEBUG via env if needed.
 	log {
 		output stderr
 		level INFO
 		format console
-	}
-}
-
-:8080 {
-	# Trust the OpenHost router's X-Forwarded-* headers. Anything else
-	# would be rewritten/stripped here, but in practice we're behind
-	# exactly one proxy (the OpenHost router) and that proxy is what
-	# sets X-Forwarded-Host to the public hostname the user typed.
-	#
-	# `client_ip_headers` tells Caddy to populate {client_ip} from
-	# X-Forwarded-For so logs reflect the real visitor IP rather than
-	# the OpenHost router's container address.
-	servers {
-		client_ip_headers X-Forwarded-For
-		trusted_proxies static private_ranges
 	}
 }
 
