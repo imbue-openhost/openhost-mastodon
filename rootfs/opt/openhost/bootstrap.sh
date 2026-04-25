@@ -214,36 +214,54 @@ fi
 # schema_migrations table and applies anything new. On first boot it
 # walks every migration and creates all the tables.
 #
-# We add SKIP_POST_DEPLOYMENT_MIGRATIONS=true on the first migrate
-# pass to follow upstream's recommended two-phase upgrade procedure
-# (see docs/admin/upgrading), then a second pass without it to apply
-# the post-deployment ones. On a brand-new database both passes run
-# every migration; on a migration-up-to-date database both are no-ops.
+# DO NOT set SKIP_POST_DEPLOYMENT_MIGRATIONS=true here. That env var is
+# meant for the rolling-upgrade procedure documented at
+# docs.joinmastodon.org/admin/upgrading/ — it's only sensible when the
+# database is at a version >= 4.2 and you want to migrate without
+# downtime. On a brand-new database the upstream rake task
+# `db:pre_migration_check` rejects it outright because it can't
+# distinguish "fresh database" from "obsolete pre-4.2 database" when
+# the schema_migrations table doesn't have any of the marker rows it
+# expects. We just run a plain db:migrate which works for both fresh
+# installs (creates the schema from migration zero) and ongoing
+# upgrades (applies whatever's new since the last boot).
 log "running db:migrate (this is slow on first boot — be patient)"
 cd /opt/mastodon
-s6-setuidgid mastodon env \
-    LOCAL_DOMAIN="$LOCAL_DOMAIN" WEB_DOMAIN="$WEB_DOMAIN" \
-    DATABASE_URL="$DATABASE_URL" REDIS_URL="$REDIS_URL" \
-    DB_HOST="$DB_HOST" DB_USER="$DB_USER" DB_NAME="$DB_NAME" DB_PORT="$DB_PORT" \
-    SECRET_KEY_BASE="$SECRET_KEY_BASE" OTP_SECRET="$OTP_SECRET" \
-    VAPID_PRIVATE_KEY="$VAPID_PRIVATE_KEY" VAPID_PUBLIC_KEY="$VAPID_PUBLIC_KEY" \
-    ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY="$ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY" \
-    ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY="$ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY" \
-    ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT="$ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT" \
-    RAILS_ENV=production SKIP_POST_DEPLOYMENT_MIGRATIONS=true \
-    /usr/local/bin/bundle exec rails db:migrate
 
-s6-setuidgid mastodon env \
-    LOCAL_DOMAIN="$LOCAL_DOMAIN" WEB_DOMAIN="$WEB_DOMAIN" \
-    DATABASE_URL="$DATABASE_URL" REDIS_URL="$REDIS_URL" \
-    DB_HOST="$DB_HOST" DB_USER="$DB_USER" DB_NAME="$DB_NAME" DB_PORT="$DB_PORT" \
-    SECRET_KEY_BASE="$SECRET_KEY_BASE" OTP_SECRET="$OTP_SECRET" \
-    VAPID_PRIVATE_KEY="$VAPID_PRIVATE_KEY" VAPID_PUBLIC_KEY="$VAPID_PUBLIC_KEY" \
-    ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY="$ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY" \
-    ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY="$ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY" \
-    ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT="$ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT" \
-    RAILS_ENV=production \
-    /usr/local/bin/bundle exec rails db:migrate
+# We pass every Mastodon-required env var explicitly to env(1) so the
+# subshell sees them whether or not s6's container_environment has
+# propagated yet. (set -a + source above already exported them, but
+# `s6-setuidgid` reset HOME — Ruby's bundler then complains that /root
+# isn't writable. The HOME=/tmp override fixes that.)
+mastodon_run_rake() {
+    s6-setuidgid mastodon env \
+        HOME=/tmp \
+        LOCAL_DOMAIN="$LOCAL_DOMAIN" WEB_DOMAIN="$WEB_DOMAIN" \
+        DATABASE_URL="$DATABASE_URL" REDIS_URL="$REDIS_URL" \
+        DB_HOST="$DB_HOST" DB_USER="$DB_USER" \
+        DB_NAME="$DB_NAME" DB_PORT="$DB_PORT" \
+        SECRET_KEY_BASE="$SECRET_KEY_BASE" OTP_SECRET="$OTP_SECRET" \
+        VAPID_PRIVATE_KEY="$VAPID_PRIVATE_KEY" \
+        VAPID_PUBLIC_KEY="$VAPID_PUBLIC_KEY" \
+        ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY="$ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY" \
+        ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY="$ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY" \
+        ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT="$ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT" \
+        RAILS_ENV=production \
+        "$@"
+}
+
+mastodon_run_rake /usr/local/bin/bundle exec rails db:migrate
+
+# `db:seed` populates the default UserRole rows (Owner, Admin, Moderator)
+# and is required for tootctl to create users with --role Owner. It is
+# idempotent — Mastodon's seed file uses `find_or_create_by!` for every
+# row, so running it on every boot is safe and only takes a second once
+# the rows are already there. We could gate this on first-boot but
+# rake-task overhead is dominated by Rails boot (~10s) regardless of
+# whether the seed actually inserts anything, and we already paid that
+# cost for db:migrate. Run it unconditionally.
+log "running db:seed (idempotent)"
+mastodon_run_rake /usr/local/bin/bundle exec rails db:seed
 
 # ----- 6. bootstrap admin user (first boot only) ------------------------
 #
@@ -266,17 +284,7 @@ else
     # `--role Owner` grants the highest permission level (Mastodon's
     # built-in role hierarchy: User < Moderator < Admin < Owner).
     set +e
-    TOOTCTL_OUTPUT=$(s6-setuidgid mastodon env \
-        LOCAL_DOMAIN="$LOCAL_DOMAIN" WEB_DOMAIN="$WEB_DOMAIN" \
-        DATABASE_URL="$DATABASE_URL" REDIS_URL="$REDIS_URL" \
-        DB_HOST="$DB_HOST" DB_USER="$DB_USER" DB_NAME="$DB_NAME" DB_PORT="$DB_PORT" \
-        SECRET_KEY_BASE="$SECRET_KEY_BASE" OTP_SECRET="$OTP_SECRET" \
-        VAPID_PRIVATE_KEY="$VAPID_PRIVATE_KEY" VAPID_PUBLIC_KEY="$VAPID_PUBLIC_KEY" \
-        ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY="$ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY" \
-        ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY="$ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY" \
-        ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT="$ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT" \
-        RAILS_ENV=production \
-        /opt/mastodon/bin/tootctl accounts create "$ADMIN_USER" \
+    TOOTCTL_OUTPUT=$(mastodon_run_rake /opt/mastodon/bin/tootctl accounts create "$ADMIN_USER" \
             --email "$ADMIN_EMAIL" \
             --confirmed \
             --role Owner 2>&1)
