@@ -71,10 +71,15 @@ RUN apt-get update \
 # streaming process and everything else to Puma, and rewrites the Host
 # header from X-Forwarded-Host so Mastodon sees the public hostname (the
 # OpenHost router strips Host on the way through).
-RUN install -d -m 0755 /etc/apt/keyrings \
+#
+# We don't use cloudsmith's bundled debian.deb.txt because it hardcodes
+# the keyring path /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+# while we want the key file in /etc/apt/keyrings (modern Debian
+# convention). Easier to just write the .list ourselves.
+RUN install -d -m 0755 /usr/share/keyrings \
  && curl -1sSLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-        | gpg --dearmor -o /etc/apt/keyrings/caddy.gpg \
- && curl -1sSLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+        | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" \
         > /etc/apt/sources.list.d/caddy-stable.list
 
 RUN apt-get update \
