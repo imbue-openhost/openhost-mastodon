@@ -25,10 +25,10 @@
 #      exist yet. We use the local socket as the postgres superuser
 #      (trust auth set by pg-init).
 #   4. Run db:migrate (no-op when up to date).
-#   5. On the very first boot, create an admin user via
-#      `tootctl accounts create operator --confirmed --role Owner` and
-#      capture the rake-printed temporary password to
-#      $OPENHOST_APP_DATA_DIR/admin-password.txt.
+#   5. On the very first boot, create an Owner account via
+#      `tootctl accounts create operator --confirmed --role Owner`. The
+#      generated password is discarded, NOT written to disk — the zone
+#      owner logs in through OpenHost SSO (auth_proxy + session_minter).
 #
 # When this script exits 0, the three Mastodon longruns (web, sidekiq,
 # streaming) start in parallel.
@@ -289,91 +289,54 @@ mastodon_run /usr/local/bin/bundle exec rails db:seed
 
 # ----- 6. bootstrap admin user (first boot only) ------------------------
 #
-# `tootctl accounts create` prints a generated password to stdout in
-# the format:  "OK\nNew password: xxxx" — we capture that and stash it
-# under $OPENHOST_APP_DATA_DIR/admin-password.txt for the operator to
-# read once.
+# We create a single Owner-role account (`operator`) on first boot. The
+# operator NEVER needs a password: OpenHost owner SSO (auth_proxy.py +
+# session_minter.rb) logs the zone owner straight into this account.
 #
-# Marker policy (this is load-bearing — get it wrong and operators end
-# up with no admin and no auto-retry):
+# CREDENTIAL-LEAK POLICY (this is the important change from earlier
+# builds): we do NOT persist the account password to disk. OpenHost
+# bind-mounts $OPENHOST_APP_DATA_DIR into other apps that hold the
+# `access_all_data` permission (e.g. the file-browser app), so a
+# plaintext `admin-password.txt` here would be readable by them. That
+# file is gone. `tootctl accounts create` still generates a random
+# password internally (Mastodon requires one), but we capture it only
+# long enough to confirm the create succeeded and then discard it — it
+# never touches the filesystem. If the operator ever genuinely needs a
+# password (e.g. to log in from a device that isn't behind OpenHost
+# SSO), they reset one on demand from the OpenHost system terminal:
 #
-#   - On clean success (tootctl rc=0 AND password parsed AND file
-#     written) we write the marker so subsequent boots skip this
-#     section. Re-running would either fail (user exists) or, worse,
-#     create a confusing second password.
+#     podman exec openhost-mastodon \
+#         s6-setuidgid mastodon env HOME=/tmp \
+#         /opt/mastodon/bin/tootctl accounts modify operator --reset-password
 #
-#   - If tootctl fails because the user already exists (e.g. an old
-#     buggy build deleted the marker but left the user behind, or the
-#     operator created the user manually), we also write the marker:
-#     retrying won't help, so stop trying. We drop a placeholder
-#     password file that explains the situation and how to reset.
+# Marker policy (load-bearing — get it wrong and operators end up with
+# no admin and no auto-retry):
 #
-#   - On any *other* failure (tootctl crashed, db not ready, output
-#     parser couldn't find the password line, etc.) we DO NOT write
-#     the marker. The next boot will retry. This is safe because
-#     tootctl's own duplicate-check covers the case where the user
-#     was actually created on a prior attempt; we'll fall through to
-#     the already-exists branch above.
+#   - On clean success (tootctl rc=0 AND a password line was parsed, so
+#     we know the account was really created) we write the marker so
+#     subsequent boots skip this section.
+#   - If tootctl fails because the user already exists, we also write
+#     the marker: retrying won't help.
+#   - On any *other* failure we DO NOT write the marker, so the next
+#     boot retries.
 ADMIN_MARKER="$PERSIST/.admin-bootstrapped"
-ADMIN_PW_FILE="$PERSIST/admin-password.txt"
+LEGACY_PW_FILE="$PERSIST/admin-password.txt"
 ADMIN_USER="${ADMIN_USERNAME:-operator}"
 ADMIN_EMAIL="${ADMIN_EMAIL:-${ADMIN_USER}@${LOCAL_DOMAIN}}"
 
-write_admin_pw_file() {
-    # $1: password OR empty for the placeholder used by the
-    # already-exists branch.
-    local password="$1"
-    umask 077
-    if [[ -n "$password" ]]; then
-        cat > "$ADMIN_PW_FILE" <<EOF
-Mastodon admin user (created on first boot)
-==========================================
-URL:       https://$LOCAL_DOMAIN
-Username:  $ADMIN_USER
-Email:     $ADMIN_EMAIL
-Password:  $password
-
-Read this once and rotate the password from
-  Preferences → Account → Change password
-after first login.
-
-(File is at \$OPENHOST_APP_DATA_DIR/admin-password.txt; from the
-OpenHost system terminal it lives at
-\$OPENHOST_DATA_ROOT/persistent_data/app_data/mastodon/admin-password.txt.)
-EOF
-    else
-        cat > "$ADMIN_PW_FILE" <<EOF
-Mastodon admin user already exists
-==================================
-URL:       https://$LOCAL_DOMAIN
-Username:  $ADMIN_USER
-Email:     $ADMIN_EMAIL
-
-The bootstrap script could not create this user because it already
-exists in the database, but no first-boot password was ever captured
-to this file (most likely because an earlier buggy bootstrap touched
-the marker file before writing this one).
-
-To recover, reset the password from inside the running container:
-
-    podman exec openhost-mastodon \\
-        s6-setuidgid mastodon env HOME=/tmp \\
-        /opt/mastodon/bin/tootctl accounts modify $ADMIN_USER \\
-            --reset-password
-
-tootctl prints the new password to stdout. After logging in, change
-it from Preferences → Account → Change password.
-EOF
-    fi
-    chmod 0600 "$ADMIN_PW_FILE"
-    chown mastodon:mastodon "$ADMIN_PW_FILE"
-}
+# Scrub any plaintext password file left behind by an earlier build that
+# persisted credentials. This runs on every boot so upgrading an
+# existing deploy self-heals the leak.
+if [[ -e "$LEGACY_PW_FILE" ]]; then
+    log "removing legacy plaintext credentials file $LEGACY_PW_FILE (SSO makes it unnecessary)"
+    rm -f "$LEGACY_PW_FILE"
+fi
 
 # Returns 0 on clean success, 2 if the user already exists, 1 on any
-# other failure. Outputs the captured admin password to stdout on
-# clean success only.
+# other failure. Emits NOTHING sensitive to stdout — the generated
+# password is parsed only to verify creation, then dropped on the floor.
 bootstrap_admin() {
-    local output rc
+    local output rc password
     set +e
     output=$(mastodon_run /opt/mastodon/bin/tootctl accounts create "$ADMIN_USER" \
             --email "$ADMIN_EMAIL" \
@@ -383,23 +346,18 @@ bootstrap_admin() {
     set -e
 
     if [[ $rc -eq 0 ]]; then
-        # tootctl prints "OK\nNew password: <pw>" on success.
-        local password
-        password=$(echo "$output" | sed -n 's/^New password: //p')
-        if [[ -z "$password" ]]; then
-            log "tootctl returned 0 but did not print a password; full output follows:"
+        # tootctl prints "OK\nNew password: <pw>" on success. We only
+        # check that the password line exists as proof of creation; the
+        # value itself is intentionally never captured into a variable
+        # that outlives this function or written anywhere.
+        if ! echo "$output" | grep -q '^New password: '; then
+            log "tootctl returned 0 but did not print a password line; full output follows:"
             echo "$output" >&2
             return 1
         fi
-        printf '%s\n' "$password"
         return 0
     fi
 
-    # tootctl exited non-zero. Treat "user already exists" as a
-    # distinct, non-retryable outcome. The exact message comes from
-    # ActiveModel validation: "Username has already been taken" or
-    # "Email has already been taken". Either is enough to tell us the
-    # account is in the DB.
     if echo "$output" | grep -qiE "(Username|Email).*already been taken"; then
         log "tootctl reports admin user '$ADMIN_USER' already exists"
         return 2
@@ -412,43 +370,28 @@ bootstrap_admin() {
 
 if [[ -f "$ADMIN_MARKER" ]]; then
     log "admin user already bootstrapped; skipping"
-    # Defend against the legacy buggy path where the marker was
-    # written but the password file never was. Leaving the operator
-    # with neither file is the worst possible outcome — at least give
-    # them a hint they can act on.
-    if [[ ! -f "$ADMIN_PW_FILE" ]]; then
-        log "WARN: $ADMIN_MARKER exists but $ADMIN_PW_FILE is missing."
-        log "WARN: writing a placeholder explaining how to reset the password."
-        write_admin_pw_file ""
-    fi
 else
     log "creating admin user '$ADMIN_USER' (email=$ADMIN_EMAIL)"
     # `--confirmed` skips the email confirmation flow we can't deliver.
     # `--role Owner` grants the highest permission level (Mastodon's
     # built-in role hierarchy: User < Moderator < Admin < Owner).
     set +e
-    NEW_ADMIN_PASSWORD=$(bootstrap_admin)
+    bootstrap_admin
     BOOTSTRAP_RC=$?
     set -e
 
     case "$BOOTSTRAP_RC" in
         0)
-            write_admin_pw_file "$NEW_ADMIN_PASSWORD"
             touch "$ADMIN_MARKER"
-            log "admin user created; credentials at $ADMIN_PW_FILE"
+            log "admin user '$ADMIN_USER' created; log in via OpenHost owner SSO"
             ;;
         2)
-            # User already exists. Stop retrying (marker), explain how
-            # to recover (placeholder password file).
-            write_admin_pw_file ""
             touch "$ADMIN_MARKER"
-            log "admin already exists; placeholder written to $ADMIN_PW_FILE"
+            log "admin user '$ADMIN_USER' already exists; log in via OpenHost owner SSO"
             ;;
         *)
-            # Transient or unknown failure: leave the marker absent so
-            # the next bootstrap attempt retries.
             log "WARN: admin bootstrap failed; will retry on next boot"
-            log "WARN: marker NOT written; password file NOT written"
+            log "WARN: marker NOT written"
             log "WARN: if this persists, run tootctl manually inside the container"
             ;;
     esac

@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""auth_proxy.py — OpenHost SSO front-door for Mastodon.
+
+Sits at :8080 (the port openhost.toml declares to the OpenHost router)
+and reverse-proxies every request to Caddy at 127.0.0.1:8090, which in
+turn fans out to Puma (:3000) and the streaming node server (:4000).
+
+The *only* behaviour this proxy adds on top of a transparent reverse
+proxy is owner auto-login:
+
+  When the OpenHost router forwards a request from the authenticated
+  zone owner it stamps `X-OpenHost-Is-Owner: true`. On the owner's first
+  top-level HTML navigation that does not already carry a Mastodon
+  session cookie, we ask the Ruby session-minter (over a loopback UNIX
+  socket) to mint a real Mastodon session for the bootstrap `operator`
+  account, then 302 the owner back to the URL they asked for with the
+  minted cookies attached. From then on Mastodon's own session cookies
+  carry them and this proxy is a pure passthrough.
+
+Everything else — federation inbox deliveries, WebFinger, public
+timelines, the streaming WebSocket, anonymous visitors reading public
+posts, non-owner logged-in users — flows straight through untouched.
+This is essential: Mastodon federates with the wider fediverse, so
+`public_paths = ["/"]` in openhost.toml means the OpenHost owner-auth
+gate is disabled and random remote servers reach us directly. We must
+never mint a session for, redirect, or otherwise interfere with those
+requests. The owner-auto-login path is gated on the `X-OpenHost-Is-Owner`
+header, which only the OpenHost router can set, so remote/anonymous
+traffic can never trigger it.
+
+Design constraints that shaped this file:
+
+  * No third-party Python deps. Mastodon's base image is Ruby; we add
+    only the system `python3`. Stdlib http.server + socket only.
+  * Streaming (`/api/v1/streaming`) is long-lived WebSocket/SSE. We
+    bypass this proxy's buffering entirely for those paths and hand the
+    socket to a raw bidirectional pump so upgrades and long polls work.
+  * The proxy must be transparent about the Host header. The OpenHost
+    router already sets X-Forwarded-Host; Caddy rewrites Host from it
+    downstream. We forward all headers unchanged so Caddy's existing
+    logic keeps working.
+"""
+
+import http.client
+import os
+import select
+import socket
+import sys
+import threading
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+LISTEN_HOST = "0.0.0.0"
+LISTEN_PORT = int(os.environ.get("AUTH_PROXY_PORT", "8080"))
+
+# Caddy front-door (the former :8080 listener, moved to :8090 so this
+# proxy can take the public port).
+UPSTREAM_HOST = "127.0.0.1"
+UPSTREAM_PORT = int(os.environ.get("CADDY_PORT", "8090"))
+
+# UNIX socket the Ruby session-minter listens on.
+MINTER_SOCK = os.environ.get("MINTER_SOCK", "/run/mastodon/minter.sock")
+
+# Header the OpenHost router stamps for the authenticated zone owner.
+OWNER_HEADER = "x-openhost-is-owner"
+
+# Mastodon session cookies. If any of these is already present we treat
+# the visitor as having a (possibly stale) session and do NOT auto-login
+# — that avoids clobbering a real login and avoids a redirect loop.
+MASTODON_SESSION_COOKIES = ("_mastodon_session", "_session_id")
+
+# Paths we must never auto-login on even for the owner: the login/logout
+# machinery, the streaming endpoint, and anything that isn't a browser
+# navigation. Auto-login only makes sense for top-level HTML GETs.
+NO_AUTOLOGIN_PREFIXES = (
+    "/auth/",           # Devise sign-in/out/registration
+    "/api/",            # REST + streaming; never HTML navigations
+    "/oauth/",          # OAuth authorize/token
+    "/.well-known/",    # WebFinger, nodeinfo, host-meta
+    "/inbox",           # ActivityPub shared inbox
+    "/users/",          # ActivityPub actor inboxes/outboxes
+    "/nodeinfo",
+    "/health",
+    "/manifest",
+    "/packs/",          # asset bundles
+    "/system/",         # uploads
+    "/sw.js",
+    "/assets/",
+)
+
+# Hop-by-hop headers we must not forward verbatim (RFC 7230 §6.1).
+HOP_BY_HOP = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+}
+
+
+def log(msg):
+    sys.stderr.write(f"[auth-proxy] {msg}\n")
+    sys.stderr.flush()
+
+
+def mint_session(remote_ip, user_agent, timeout=15.0):
+    """Ask the Ruby minter for a fresh owner session.
+
+    Returns a list of (name, value, max_age) cookie tuples on success,
+    or None on any failure (in which case we just proxy through and the
+    owner sees Mastodon's normal login form — a safe degradation).
+    """
+    import json
+
+    req = "MINT {ip} {ua}\n".format(
+        ip=remote_ip or "127.0.0.1",
+        ua=urllib.parse.quote(user_agent or ""),
+    )
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(MINTER_SOCK)
+            s.sendall(req.encode("utf-8"))
+            buf = b""
+            while b"\n" not in buf:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        line = buf.split(b"\n", 1)[0].decode("utf-8", "replace")
+        data = json.loads(line)
+    except (OSError, ValueError) as e:
+        log(f"minter call failed: {e}")
+        return None
+
+    if not data.get("ok"):
+        log(f"minter refused: {data.get('error')}")
+        return None
+
+    cookies = []
+    for c in data.get("cookies", []):
+        cookies.append((c["name"], c["value"], int(c.get("max_age", 0))))
+    return cookies
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    # Quieter default logging; we log what we care about ourselves.
+    def log_message(self, *args):
+        pass
+
+    # ---- helpers ------------------------------------------------------
+
+    def _client_ip(self):
+        xff = self.headers.get("X-Forwarded-For", "")
+        if xff:
+            return xff.split(",")[0].strip()
+        return self.client_address[0] if self.client_address else "127.0.0.1"
+
+    def _has_mastodon_session(self):
+        raw = self.headers.get("Cookie", "")
+        if not raw:
+            return False
+        # Cheap substring check is enough — cookie names are distinctive.
+        return any(f"{name}=" in raw for name in MASTODON_SESSION_COOKIES)
+
+    def _is_owner(self):
+        return self.headers.get(OWNER_HEADER, "").strip().lower() == "true"
+
+    def _is_html_navigation(self):
+        if self.command != "GET":
+            return False
+        accept = self.headers.get("Accept", "")
+        return "text/html" in accept.lower()
+
+    def _path_blocks_autologin(self):
+        path = urllib.parse.urlparse(self.path).path
+        return any(path.startswith(p) for p in NO_AUTOLOGIN_PREFIXES)
+
+    def _should_autologin(self):
+        return (
+            self._is_owner()
+            and not self._has_mastodon_session()
+            and self._is_html_navigation()
+            and not self._path_blocks_autologin()
+        )
+
+    # ---- request entrypoints -----------------------------------------
+
+    def do_GET(self):
+        self._dispatch()
+
+    def do_POST(self):
+        self._dispatch()
+
+    def do_PUT(self):
+        self._dispatch()
+
+    def do_DELETE(self):
+        self._dispatch()
+
+    def do_PATCH(self):
+        self._dispatch()
+
+    def do_HEAD(self):
+        self._dispatch()
+
+    def do_OPTIONS(self):
+        self._dispatch()
+
+    # ---- core ---------------------------------------------------------
+
+    def _dispatch(self):
+        # Streaming / WebSocket upgrade → raw tunnel, no buffering.
+        path = urllib.parse.urlparse(self.path).path
+        upgrade = self.headers.get("Upgrade", "").lower()
+        if upgrade == "websocket" or path.startswith("/api/v1/streaming"):
+            self._tunnel()
+            return
+
+        if self._should_autologin():
+            cookies = mint_session(
+                self._client_ip(), self.headers.get("User-Agent", "")
+            )
+            if cookies:
+                self._send_autologin_redirect(cookies)
+                return
+            # Minter unavailable → fall through and proxy normally; the
+            # owner will just see the login form. Never block the app on
+            # SSO being down.
+
+        self._proxy()
+
+    def _send_autologin_redirect(self, cookies):
+        """302 back to the same URL, attaching the minted session cookies.
+
+        We redirect to the exact URL the owner requested so that after
+        the browser stores the cookies and re-requests, this proxy sees
+        _mastodon_session present, skips auto-login, and proxies through
+        to a now-authenticated Mastodon.
+        """
+        location = self.path  # same path+query, relative redirect
+        body = b"Signing you in..."
+        try:
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            for name, value, max_age in cookies:
+                # Secure + HttpOnly + SameSite=Lax + path=/. Secure is
+                # safe: the OpenHost router always fronts us over TLS.
+                cookie = (
+                    f"{name}={value}; Path=/; Max-Age={max_age}; "
+                    f"HttpOnly; Secure; SameSite=Lax"
+                )
+                self.send_header("Set-Cookie", cookie)
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _proxy(self):
+        # Read request body if present.
+        body = b""
+        cl = self.headers.get("Content-Length")
+        if cl:
+            try:
+                body = self.rfile.read(int(cl))
+            except (ValueError, OSError):
+                body = b""
+
+        # Build upstream headers: copy everything except hop-by-hop.
+        out_headers = []
+        for key in self.headers.keys():
+            if key.lower() in HOP_BY_HOP:
+                continue
+            for value in self.headers.get_all(key):
+                out_headers.append((key, value))
+
+        try:
+            conn = http.client.HTTPConnection(
+                UPSTREAM_HOST, UPSTREAM_PORT, timeout=310
+            )
+            conn.putrequest(
+                self.command, self.path, skip_host=True, skip_accept_encoding=True
+            )
+            for key, value in out_headers:
+                conn.putheader(key, value)
+            if cl:
+                # Content-Length already among headers; body follows.
+                pass
+            conn.endheaders()
+            if body:
+                conn.send(body)
+
+            resp = conn.getresponse()
+        except OSError as e:
+            log(f"upstream connect failed: {e}")
+            self._send_bad_gateway()
+            return
+
+        try:
+            self.send_response_only(resp.status, resp.reason)
+            # Relay response headers, dropping hop-by-hop.
+            for key, value in resp.getheaders():
+                if key.lower() in HOP_BY_HOP:
+                    continue
+                self.send_header(key, value)
+            self.end_headers()
+
+            # Stream the body through in chunks.
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+        finally:
+            conn.close()
+
+    def _send_bad_gateway(self):
+        body = b"502 Bad Gateway (Mastodon starting up)"
+        try:
+            self.send_response(502)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Retry-After", "5")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _tunnel(self):
+        """Raw bidirectional byte pump to Caddy for WebSocket/streaming.
+
+        We reconstruct the request line + headers verbatim, open a plain
+        TCP socket to Caddy, replay them, then shuttle bytes both ways
+        until either side closes. This preserves the WebSocket upgrade
+        handshake and SSE long-polls that http.client would mangle.
+        """
+        try:
+            upstream = socket.create_connection(
+                (UPSTREAM_HOST, UPSTREAM_PORT), timeout=10
+            )
+        except OSError as e:
+            log(f"tunnel connect failed: {e}")
+            self._send_bad_gateway()
+            return
+
+        # Rebuild and send the original request head.
+        head = [f"{self.command} {self.path} {self.request_version}"]
+        for key in self.headers.keys():
+            for value in self.headers.get_all(key):
+                head.append(f"{key}: {value}")
+        head.append("")
+        head.append("")
+        try:
+            upstream.sendall("\r\n".join(head).encode("latin-1"))
+        except OSError as e:
+            log(f"tunnel head send failed: {e}")
+            upstream.close()
+            return
+
+        client = self.connection
+        client.setblocking(False)
+        upstream.setblocking(False)
+        sockets = [client, upstream]
+        try:
+            while True:
+                readable, _, exceptional = select.select(sockets, [], sockets, 300)
+                if exceptional:
+                    break
+                if not readable:
+                    # Idle timeout window elapsed with no data; keep
+                    # looping — WebSockets can idle. select's timeout is
+                    # just to avoid a truly infinite block if both peers
+                    # vanish without FIN.
+                    continue
+                for s in readable:
+                    try:
+                        data = s.recv(65536)
+                    except (BlockingIOError, InterruptedError):
+                        continue
+                    except OSError:
+                        return
+                    if not data:
+                        return
+                    dst = upstream if s is client else client
+                    try:
+                        dst.sendall(data)
+                    except OSError:
+                        return
+        finally:
+            upstream.close()
+
+
+def main():
+    server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
+    server.daemon_threads = True
+    log(f"listening on {LISTEN_HOST}:{LISTEN_PORT} -> "
+        f"{UPSTREAM_HOST}:{UPSTREAM_PORT}; minter={MINTER_SOCK}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

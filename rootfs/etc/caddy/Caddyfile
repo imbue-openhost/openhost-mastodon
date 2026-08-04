@@ -1,7 +1,10 @@
 # Caddy front-door for the all-in-one Mastodon container.
 #
-# Listens on :8080 (matches openhost.toml's `port`). Splits traffic
-# between the two upstream Mastodon processes:
+# Listens on :8090 (behind the auth_proxy, which owns the public :8080
+# that openhost.toml's `port` declares). The auth_proxy is a thin
+# reverse proxy that adds OpenHost owner auto-login and otherwise hands
+# every request straight to this Caddy. Splits traffic between the two
+# upstream Mastodon processes:
 #
 #   /api/v1/streaming/*  →  127.0.0.1:4000  (node streaming, WebSockets)
 #   everything else      →  127.0.0.1:3000  (puma web, REST + UI)
@@ -44,7 +47,7 @@
 	}
 }
 
-:8080 {
+:8090 {
 	# Set a virtual {forwarded_host} variable that prefers
 	# X-Forwarded-Host (set by the OpenHost router) and falls back to
 	# the inbound Host (covers local smoke tests and the rare router

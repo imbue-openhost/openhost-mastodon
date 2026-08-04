@@ -1,13 +1,13 @@
 #!/command/with-contenv bash
 # Caddy front-door longrun.
 #
-# Listens on 0.0.0.0:8080 (the `port` declared in openhost.toml). Routes
-# /api/v1/streaming/* to the node streaming server on :4000 and every
-# other request to puma on :3000. Rewrites the Host header from
-# X-Forwarded-Host so Mastodon's CSRF check sees the public hostname
-# rather than 127.0.0.1.
+# Listens on :8090 (behind the auth_proxy, which owns the public :8080
+# declared in openhost.toml). Routes /api/v1/streaming/* to the node
+# streaming server on :4000 and every other request to puma on :3000.
+# Rewrites the Host header from X-Forwarded-Host so Mastodon's CSRF
+# check sees the public hostname rather than 127.0.0.1.
 #
-# Caddy doesn't need root for the unprivileged 8080 bind; we drop to
+# Caddy doesn't need root for the unprivileged 8090 bind; we drop to
 # the `caddy` user the apt package installs.
 set -eu
 

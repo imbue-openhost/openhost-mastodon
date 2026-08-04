@@ -1,0 +1,30 @@
+#!/command/with-contenv bash
+# auth-proxy longrun.
+#
+# The public front-door. Owns :8080 (the port openhost.toml declares to
+# the OpenHost router) and reverse-proxies everything to Caddy on :8090.
+# The only behaviour it adds is OpenHost owner auto-login: on an
+# X-OpenHost-Is-Owner HTML navigation with no existing Mastodon session
+# it calls the session-minter over $MINTER_SOCK and 302s the owner back
+# with real Mastodon session cookies. Federation, public, anonymous and
+# streaming traffic all pass straight through.
+#
+# Runs as the `mastodon` user so it can connect to the minter's UNIX
+# socket (created 0600 by the mastodon-owned minter). It needs no DB or
+# secrets access of its own.
+#
+# Depends on caddy (its upstream). It does NOT hard-depend on
+# session-minter: the proxy degrades gracefully (owner sees Mastodon's
+# native login form) when the minter socket isn't up yet, so we avoid
+# coupling the public listener's availability to the ~10s Rails boot.
+set -eu
+
+export AUTH_PROXY_PORT="${AUTH_PROXY_PORT:-8080}"
+export CADDY_PORT="${CADDY_PORT:-8090}"
+export MINTER_SOCK="${MINTER_SOCK:-/run/mastodon/minter.sock}"
+
+exec s6-setuidgid mastodon env \
+    AUTH_PROXY_PORT="$AUTH_PROXY_PORT" \
+    CADDY_PORT="$CADDY_PORT" \
+    MINTER_SOCK="$MINTER_SOCK" \
+    /usr/bin/python3 /opt/openhost/auth_proxy.py
