@@ -61,6 +61,22 @@ UPSTREAM_PORT = int(os.environ.get("CADDY_PORT", "8090"))
 # UNIX socket the Ruby session-minter listens on.
 MINTER_SOCK = os.environ.get("MINTER_SOCK", "/run/mastodon/minter.sock")
 
+# The OpenHost health-check path (must match openhost.toml's
+# routing.health_check). The auth-proxy owns the public port and starts
+# BEFORE the Mastodon backend is ready (first boot walks ~250 db
+# migrations + a Rails cold boot, which can take a few minutes). During
+# that window Caddy/puma aren't listening yet, so proxying the health
+# check upstream would fail and OpenHost would mark the app "App started
+# but not responding to HTTP" even though it's just still booting.
+#
+# To avoid that false failure, the auth-proxy answers the health path
+# itself with a 200 whenever the upstream isn't reachable yet. Once the
+# backend is up, the health check is proxied through to Mastodon's real
+# /health as normal. Net effect: OpenHost sees a live, healthy HTTP
+# server from the very first second, and the slow first boot no longer
+# trips a spurious failure.
+HEALTH_PATH = os.environ.get("HEALTH_PATH", "/health")
+
 # Header the OpenHost router stamps for the authenticated zone owner.
 OWNER_HEADER = "x-openhost-is-owner"
 
@@ -227,8 +243,21 @@ class Handler(BaseHTTPRequestHandler):
     # ---- core ---------------------------------------------------------
 
     def _dispatch(self):
-        # Streaming / WebSocket upgrade → raw tunnel, no buffering.
         path = urllib.parse.urlparse(self.path).path
+
+        # Health check: keep the public port answering 200 during the slow
+        # first boot even before the Mastodon backend is up, so OpenHost
+        # doesn't flag a still-booting instance as "not responding to
+        # HTTP". If the upstream is reachable we proxy through to
+        # Mastodon's real /health; if not, we serve a local 200 placeholder.
+        if path == HEALTH_PATH:
+            if self._upstream_ready():
+                self._proxy()
+            else:
+                self._send_starting_health()
+            return
+
+        # Streaming / WebSocket upgrade → raw tunnel, no buffering.
         upgrade = self.headers.get("Upgrade", "").lower()
         if upgrade == "websocket" or path.startswith("/api/v1/streaming"):
             self._tunnel()
@@ -402,6 +431,37 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Retry-After", "5")
             self.end_headers()
             self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _upstream_ready(self):
+        """Cheap TCP connect probe to the Caddy upstream.
+
+        Used only on the health path to decide whether to proxy the real
+        Mastodon health check or answer a local "starting" 200. A short
+        timeout keeps the health probe fast during boot.
+        """
+        try:
+            with socket.create_connection(
+                (UPSTREAM_HOST, UPSTREAM_PORT), timeout=2
+            ):
+                return True
+        except OSError:
+            return False
+
+    def _send_starting_health(self):
+        """Answer the health path with 200 while the backend is still
+        booting, so OpenHost's health check passes during the slow first
+        boot instead of flagging a spurious failure."""
+        body = b"OK (Mastodon starting up)\n"
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
 

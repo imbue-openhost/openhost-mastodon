@@ -11,20 +11,27 @@
 #
 # Runs as the `mastodon` user so it can connect to the minter's UNIX
 # socket (created 0600 by the mastodon-owned minter). It needs no DB or
-# secrets access of its own.
+# secrets access of its own — just Python.
 #
-# Depends on caddy (its upstream). It does NOT hard-depend on
-# session-minter: the proxy degrades gracefully (owner sees Mastodon's
-# native login form) when the minter socket isn't up yet, so we avoid
-# coupling the public listener's availability to the ~10s Rails boot.
+# It has NO s6 dependencies on purpose, so it starts at the very
+# beginning of stage 2 — BEFORE bootstrap runs db:migrate (which on a
+# first boot takes minutes). This is what keeps the public :8080 port
+# answering during the slow boot: the proxy serves the health path with
+# a 200 "starting" placeholder until the Caddy/puma backend is up, so
+# OpenHost's health check doesn't flag a still-booting instance as
+# failed. Once the backend comes up, health and all other traffic proxy
+# through normally. The proxy also degrades gracefully for owner SSO
+# (owner sees the login form) if the session-minter socket isn't up yet.
 set -eu
 
 export AUTH_PROXY_PORT="${AUTH_PROXY_PORT:-8080}"
 export CADDY_PORT="${CADDY_PORT:-8090}"
 export MINTER_SOCK="${MINTER_SOCK:-/run/mastodon/minter.sock}"
+export HEALTH_PATH="${HEALTH_PATH:-/health}"
 
 exec s6-setuidgid mastodon env \
     AUTH_PROXY_PORT="$AUTH_PROXY_PORT" \
     CADDY_PORT="$CADDY_PORT" \
     MINTER_SOCK="$MINTER_SOCK" \
+    HEALTH_PATH="$HEALTH_PATH" \
     /usr/bin/python3 /opt/openhost/auth_proxy.py
