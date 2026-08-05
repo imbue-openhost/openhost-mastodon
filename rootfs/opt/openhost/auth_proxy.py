@@ -130,6 +130,31 @@ def log(msg):
     sys.stderr.flush()
 
 
+# One-way latch: flips True the first time we observe the Caddy upstream
+# reachable, and never flips back. It bounds the "serve a fake 200 on the
+# health path" behaviour to the INITIAL boot window only. Rationale: the
+# placeholder exists so OpenHost doesn't kill a still-booting instance
+# whose backend hasn't come up yet. But once the backend HAS been up, a
+# later outage is a real failure that OpenHost must see — so after the
+# latch is set we always proxy the health check through and let genuine
+# 5xx/connection errors surface instead of masking them forever.
+_backend_ever_ready = False
+_backend_ready_lock = threading.Lock()
+
+
+def _mark_backend_ready():
+    global _backend_ever_ready
+    if not _backend_ever_ready:
+        with _backend_ready_lock:
+            if not _backend_ever_ready:
+                _backend_ever_ready = True
+                log("backend reachable; health check now proxies through")
+
+
+def _backend_was_ever_ready():
+    return _backend_ever_ready
+
+
 def mint_session(remote_ip, user_agent, timeout=15.0):
     """Ask the Ruby minter for a fresh owner session.
 
@@ -248,12 +273,23 @@ class Handler(BaseHTTPRequestHandler):
         # Health check: keep the public port answering 200 during the slow
         # first boot even before the Mastodon backend is up, so OpenHost
         # doesn't flag a still-booting instance as "not responding to
-        # HTTP". If the upstream is reachable we proxy through to
-        # Mastodon's real /health; if not, we serve a local 200 placeholder.
+        # HTTP".
+        #
+        # We only serve the fake "starting" 200 UNTIL the backend has been
+        # seen reachable at least once. After that, we always proxy the
+        # health check through to Mastodon's real /health so a genuine
+        # backend crash (which must be reported to OpenHost) is never
+        # masked by a permanent placeholder 200.
         if path == HEALTH_PATH:
             if self._upstream_ready():
+                _mark_backend_ready()
                 self._proxy()
+            elif _backend_was_ever_ready():
+                # Backend was up and is now unreachable — a real failure.
+                # Let it surface as a 502 rather than a fake 200.
+                self._send_bad_gateway()
             else:
+                # Still in the initial boot window; keep OpenHost happy.
                 self._send_starting_health()
             return
 
@@ -374,6 +410,11 @@ class Handler(BaseHTTPRequestHandler):
             log(f"upstream connect failed: {e}")
             self._send_bad_gateway()
             return
+
+        # We got a response from the upstream, so the backend is up. Flip
+        # the readiness latch so the health path stops serving the boot
+        # placeholder and starts reporting real backend status.
+        _mark_backend_ready()
 
         try:
             # Relay response headers, dropping hop-by-hop. Crucially,
