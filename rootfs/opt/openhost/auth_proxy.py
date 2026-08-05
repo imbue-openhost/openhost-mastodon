@@ -274,12 +274,17 @@ class Handler(BaseHTTPRequestHandler):
                 body = b""
 
         # Build upstream headers: copy everything except hop-by-hop.
+        # Iterate items() (one tuple per header occurrence) rather than
+        # keys()+get_all(): keys() yields duplicate names for repeated
+        # headers and get_all() returns every value for that name, so the
+        # keys()+get_all() combination would forward a header that appears
+        # N times as N*N copies. items() yields each occurrence exactly
+        # once.
         out_headers = []
-        for key in self.headers.keys():
+        for key, value in self.headers.items():
             if key.lower() in HOP_BY_HOP:
                 continue
-            for value in self.headers.get_all(key):
-                out_headers.append((key, value))
+            out_headers.append((key, value))
 
         try:
             conn = http.client.HTTPConnection(
@@ -304,23 +309,49 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            self.send_response_only(resp.status, resp.reason)
-            # Relay response headers, dropping hop-by-hop.
+            # Relay response headers, dropping hop-by-hop. Crucially,
+            # http.client has already de-chunked the body for us (we read
+            # it below via resp.read), and `transfer-encoding` is in
+            # HOP_BY_HOP so it's stripped — but that means the client is
+            # left without body framing when the upstream used chunked
+            # encoding and sent no Content-Length. Detect that case and
+            # frame the body by connection-close (a valid HTTP/1.1
+            # length-delimiter) rather than leaving the client to hang or
+            # misparse a phantom chunked stream.
+            relay_headers = []
+            has_content_length = False
             for key, value in resp.getheaders():
-                if key.lower() in HOP_BY_HOP:
+                lk = key.lower()
+                if lk in HOP_BY_HOP:
                     continue
+                if lk == "content-length":
+                    has_content_length = True
+                relay_headers.append((key, value))
+
+            close_delimited = not has_content_length
+            if close_delimited:
+                # We must not keep this connection alive: without a
+                # Content-Length or Transfer-Encoding the only way the
+                # client knows the body is complete is EOF.
+                self.close_connection = True
+
+            self.send_response_only(resp.status, resp.reason)
+            for key, value in relay_headers:
                 self.send_header(key, value)
+            if close_delimited and self.request_version != "HTTP/1.0":
+                self.send_header("Connection", "close")
             self.end_headers()
 
-            # Stream the body through in chunks.
-            while True:
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                try:
-                    self.wfile.write(chunk)
-                except (BrokenPipeError, ConnectionResetError):
-                    break
+            if self.command != "HEAD":
+                # Stream the body through in chunks.
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    try:
+                        self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
         finally:
             conn.close()
 
@@ -353,11 +384,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send_bad_gateway()
             return
 
-        # Rebuild and send the original request head.
+        # Rebuild and send the original request head. Use items() (one
+        # tuple per header occurrence) — keys()+get_all() would duplicate
+        # repeated headers N*N times (see _proxy for the same fix).
         head = [f"{self.command} {self.path} {self.request_version}"]
-        for key in self.headers.keys():
-            for value in self.headers.get_all(key):
-                head.append(f"{key}: {value}")
+        for key, value in self.headers.items():
+            head.append(f"{key}: {value}")
         head.append("")
         head.append("")
         try:
