@@ -26,9 +26,14 @@
 #      (trust auth set by pg-init).
 #   4. Run db:migrate (no-op when up to date).
 #   5. On the very first boot, create an Owner account via
-#      `tootctl accounts create operator --confirmed --role Owner`. The
-#      generated password is discarded, NOT written to disk — the zone
-#      owner logs in through OpenHost SSO (auth_proxy + session_minter).
+#      `tootctl accounts create operator --confirmed --approve
+#      --role Owner`. The generated password is discarded, NOT written
+#      to disk — the zone owner logs in through OpenHost SSO
+#      (auth_proxy + session_minter).
+#   6. Ensure the owner account is confirmed + approved on every boot
+#      (heals older approved:false accounts so SSO lands in the app).
+#   7. Seed first-boot content once (welcome post, About text, starter
+#      follows) so the instance isn't empty out of the box.
 #
 # When this script exits 0, the three Mastodon longruns (web, sidekiq,
 # streaming) start in parallel.
@@ -436,6 +441,47 @@ if s6-setuidgid postgres /usr/lib/postgresql/15/bin/psql \
     fi
 else
     log "owner account '$ADMIN_USER' not present yet; skipping confirm/approve"
+fi
+
+# ----- 8. first-boot content seeding (once) ------------------------------
+#
+# Give the owner something to look at out of the box: a welcome post, a
+# friendly About description, and a few well-known fediverse accounts
+# followed so the Home timeline fills in as federation catches up. This
+# runs ONCE, gated by its own marker, and is entirely best-effort — a
+# failure here (e.g. a remote server unreachable at boot) never blocks
+# the app. After it runs, the instance behaves exactly like a normal
+# Mastodon; the owner posts/follows/unfollows as usual.
+#
+# Gated separately from the admin marker so that on an upgrade of an
+# instance that already had its admin bootstrapped (but never seeded) we
+# still run the seed once. The seed script is itself idempotent (it
+# checks for existing statuses / follows / description) as a second line
+# of defence.
+SEED_MARKER="$PERSIST/.seeded"
+if [[ -f "$SEED_MARKER" ]]; then
+    log "content already seeded; skipping"
+elif [[ ! -f "$ADMIN_MARKER" ]]; then
+    # Admin wasn't successfully bootstrapped this boot — don't seed
+    # against a half-set-up instance; retry seeding next boot.
+    log "admin not bootstrapped yet; deferring content seeding"
+else
+    log "seeding first-boot content (welcome post, About text, starter follows)"
+    set +e
+    seed_out=$(mastodon_run /usr/local/bin/bundle exec ruby /opt/openhost/seed.rb 2>&1)
+    seed_rc=$?
+    set -e
+    # Surface the seed script's own [seed] log lines for visibility.
+    echo "$seed_out" | grep -E '^\[seed\]' >&2 || true
+    if [[ $seed_rc -eq 0 ]]; then
+        touch "$SEED_MARKER"
+        log "content seeding complete"
+    else
+        # Non-fatal. Leave the marker absent so we retry next boot; the
+        # seed script is idempotent so a partial success won't duplicate.
+        log "WARN: content seeding exited $seed_rc; will retry next boot"
+        echo "$seed_out" | tail -5 >&2
+    fi
 fi
 
 log "bootstrap complete"

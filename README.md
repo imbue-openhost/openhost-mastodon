@@ -175,9 +175,30 @@ the first boot:
   Mastodon's normal login form; it starts working on its own once the
   minter finishes booting.
 - The bundled image cold-loads ~250 MB of gem code into RAM.
+- A one-time content seed runs (welcome post + About text + a few
+  starter follows) so your instance isn't empty out of the box.
 
 You can watch progress with `GET /app_logs/mastodon` from the
 OpenHost API or via the in-host terminal.
+
+## Out-of-the-box content
+
+On the very first boot the instance seeds a little content so it's not
+an empty void when you first sign in:
+
+- A **welcome post** from your `operator` account (so your profile and
+  local timeline aren't blank).
+- A friendly **About-page description** (only if you haven't set one).
+- A few well-known fediverse accounts are **followed for you**
+  (`@Mastodon@mastodon.social`, `@fediverse@mastodon.social`,
+  `@feditips@mstdn.social`), so your Home timeline starts filling up as
+  their posts federate in over the next few minutes.
+
+This runs **once** (gated by `$OPENHOST_APP_DATA_DIR/.seeded`) and is
+best-effort — if a remote server is unreachable at boot the follow is
+just skipped. After seeding, the instance behaves like a completely
+normal Mastodon: post, follow, and unfollow (including the seeded
+accounts) however you like. Nothing re-seeds behind you.
 
 ## Persistent data
 
@@ -191,7 +212,9 @@ $OPENHOST_APP_DATA_DIR/
 │                              # SECRET_KEY_BASE, OTP_SECRET, VAPID
 │                              # keypair, postgres password.
 ├── local-domain               # The federation identity. PERMANENT.
-└── .admin-bootstrapped        # Marker so admin creation runs once.
+├── .admin-bootstrapped        # Marker so admin creation runs once.
+└── .seeded                    # Marker so first-boot content seeding
+                               # runs once (welcome post + starter follows).
 ```
 
 Everything in here is on the OpenHost-backed-up volume.
