@@ -4,17 +4,18 @@
 
 Bundles all five processes Mastodon's standard production deploy needs
 — PostgreSQL, Redis, Puma (web), Sidekiq (background workers), and the
-Node streaming server — plus a Caddy front-door, into a single
-container supervised by [s6-overlay v3](https://github.com/just-containers/s6-overlay).
+Node streaming server — plus a Caddy front-door and an OpenHost SSO
+sidecar, into a single container supervised by
+[s6-overlay v3](https://github.com/just-containers/s6-overlay).
 
 ## TL;DR
 
-Deploy via the OpenHost router. Once it's up, the admin password is in
-`$OPENHOST_APP_DATA_DIR/admin-password.txt` *inside the container*. The
-simplest way to read it is `podman exec` from the OpenHost system
-terminal — see [Logging in as admin](#logging-in-as-admin) for the
-exact command. Then log in at `https://mastodon.<your-zone>` and
-start posting.
+Deploy via the OpenHost router. Once it's up, just open
+`https://mastodon.<your-zone>` **as the zone owner** — OpenHost SSO
+logs you straight in as the instance admin (`operator`). No password to
+copy, nothing to read out of the container. Start posting. See
+[Owner SSO](#owner-sso) for how it works and how to recover a password
+if you ever need one for a non-SSO device.
 
 ## ⚠ Caveats — read these before deploying
 
@@ -88,21 +89,27 @@ work, but you only see what your followed accounts post).
       │  https (443)                         streaming wss
       │                                       (same vhost)
       ▼
-   OpenHost router  ──── http :8080 ────▶  Caddy (in container)
-                                              │
-                       /api/v1/streaming/* ───┼──▶ node :4000
-                       everything else  ─────┴──▶ puma :3000
-                                                      │
-                                                      ▼
-                                             Sidekiq (no port)
-                                                      │
-                                                      ▼
-                                  Postgres (uds) ◀────┴────▶ Redis (loopback :6379)
+   OpenHost router  ─ http :8080 ─▶  auth-proxy (SSO front-door)
+     (stamps                            │
+   X-OpenHost-Is-Owner)   owner HTML nav │ (no session) ──▶ session-minter
+                                         │                    (UNIX socket,
+                                         │                     warm Rails)
+                          everything ────┼──▶ Caddy :8090
+                                         │      │
+                     /api/v1/streaming/* ┼──────┼──▶ node :4000
+                     everything else ────┴──────┴──▶ puma :3000
+                                                       │
+                                                       ▼
+                                              Sidekiq (no port)
+                                                       │
+                                                       ▼
+                                   Postgres (uds) ◀────┴────▶ Redis (loopback :6379)
 ```
 
-All seven processes (postgres, redis, caddy, puma, sidekiq, node
-streaming, plus s6-overlay's supervisor) live in the same container.
-s6-rc dependency tracking enforces startup order:
+Nine processes (postgres, redis, caddy, puma, sidekiq, node streaming,
+the auth-proxy SSO front-door, the session-minter, plus s6-overlay's
+supervisor) live in the same container. s6-rc dependency tracking
+enforces startup order:
 
 1. `pg-init` (oneshot) — initdb on first boot, no-op afterwards.
 2. `secrets-init` (oneshot) — generate SECRET_KEY_BASE, OTP_SECRET,
@@ -112,13 +119,46 @@ s6-rc dependency tracking enforces startup order:
 4. `bootstrap` (oneshot) — depends on postgres, redis, and
    secrets-init. Waits for postgres to accept connections, creates the
    `mastodon` role + database, runs `db:migrate`, and on the first
-   boot creates the admin user via `tootctl` and stashes the
-   generated password to `admin-password.txt`.
-5. `caddy`, `mastodon-web`, `mastodon-streaming`, `mastodon-sidekiq`
-   (longruns) — start in parallel after bootstrap exits 0.
+   boot creates the `operator` Owner account via `tootctl` (the
+   generated password is discarded, never written to disk — see
+   [Owner SSO](#owner-sso)).
+5. `caddy`, `mastodon-web`, `mastodon-streaming`, `mastodon-sidekiq`,
+   `session-minter` (longruns) — start in parallel after bootstrap
+   exits 0. The `session-minter` boots Rails once (~10 s) and then
+   serves cookie-mint requests over a loopback UNIX socket.
+6. `auth-proxy` (longrun) — the public front-door on :8080. Depends on
+   `caddy`. It reverse-proxies everything to Caddy on :8090 and adds
+   OpenHost owner auto-login (see [Owner SSO](#owner-sso)).
 
 If any longrun crashes, s6 restarts it in place; `bootstrap` only
 runs once per container start.
+
+### Owner SSO
+
+The OpenHost router authenticates the zone owner and stamps
+`X-OpenHost-Is-Owner: true` on the upstream request. On the owner's
+first top-level HTML navigation that doesn't already carry a Mastodon
+session cookie, the `auth-proxy` asks the `session-minter` to create a
+real Mastodon login session for the `operator` account and 302s the
+owner back to the URL they asked for with the minted
+`_mastodon_session` + `_session_id` cookies. From then on Mastodon's
+own session carries them.
+
+The minter boots Rails once and mints those cookies through Rails' own
+`ActionDispatch` cookie jar and Devise/Warden serialization, so they
+are byte-identical to what a browser password login produces — we
+never reimplement Rails cookie crypto outside Rails, and the mechanism
+stays correct across Mastodon/Rails upgrades. The only artifact is a
+`session_activations` row in Postgres, exactly like a normal login;
+the owner can revoke it from **Preferences → Account → Sessions**.
+
+Everything that is *not* an owner HTML navigation — federation inbox
+deliveries, WebFinger, ActivityPub actor fetches, the streaming
+WebSocket, anonymous visitors reading public posts, non-owner logged-in
+users — flows straight through the auth-proxy untouched. The
+auto-login path is gated on `X-OpenHost-Is-Owner`, which only the
+OpenHost router can set, so remote/anonymous traffic can never trigger
+it.
 
 ## First boot is slow
 
@@ -128,8 +168,12 @@ the first boot:
 - `initdb` runs (~5s).
 - `db:migrate` walks ~250 migrations from `2016_02_20_174730` to
   current (~60–90s).
-- `tootctl accounts create` boots Rails and creates the admin user
-  (~30s of just Rails boot time).
+- `tootctl accounts create` boots Rails and creates the `operator`
+  Owner account (~30s of just Rails boot time).
+- The `session-minter` boots a second Rails instance (~10s) before
+  owner SSO is available. Until it's up, an owner visit falls back to
+  Mastodon's normal login form; it starts working on its own once the
+  minter finishes booting.
 - The bundled image cold-loads ~250 MB of gem code into RAM.
 
 You can watch progress with `GET /app_logs/mastodon` from the
@@ -147,87 +191,64 @@ $OPENHOST_APP_DATA_DIR/
 │                              # SECRET_KEY_BASE, OTP_SECRET, VAPID
 │                              # keypair, postgres password.
 ├── local-domain               # The federation identity. PERMANENT.
-├── admin-password.txt         # First-boot admin credentials. 0600.
 └── .admin-bootstrapped        # Marker so admin creation runs once.
 ```
 
 Everything in here is on the OpenHost-backed-up volume.
 
+> **No credentials on disk.** Earlier builds wrote the admin password
+> to `admin-password.txt` here. That was a credential-leak risk —
+> OpenHost bind-mounts this directory into other apps that hold the
+> `access_all_data` permission (e.g. the file-browser app), so the
+> plaintext password was readable by them. That file is gone: the
+> owner logs in via SSO and the bootstrap discards the generated
+> password instead of persisting it. On upgrade, any legacy
+> `admin-password.txt` left by an old build is deleted automatically
+> on the next boot. (`mastodon-secrets.env` remains — it holds
+> SECRET_KEY_BASE and the postgres password, which are only useful to
+> someone who already has database access, and rotating them would
+> invalidate every session and break web-push. It is `0600`.)
+
 ## Logging in as admin
 
-The bootstrap script writes the admin password to
-`$OPENHOST_APP_DATA_DIR/admin-password.txt` after the first successful
-boot. That env var resolves to `/data/app_data/mastodon/...` *inside
-the container*, but the bind-mounted host path varies per OpenHost
-install (e.g.  `/home/host/.openhost/local_compute_space/persistent_data/app_data/mastodon/`
-on a default Ansible-provisioned VM, somewhere else on a custom
-install). The container's view is always the same, so the
-recommended way to read the file is to exec into the container from
-the OpenHost system terminal:
+Just open `https://mastodon.<your-zone>` **as the zone owner**. The
+OpenHost router recognises you and the app's SSO sidecar logs you
+straight in as the `operator` Owner account — no password, nothing to
+copy out of the container. See [Owner SSO](#owner-sso) for the
+mechanics.
+
+The account username is `operator` (Mastodon reserves `admin`, so we
+use `operator` like the openhost-forgejo wrapper does).
+
+### I need a password (non-SSO device / API tooling)
+
+The `operator` account has no known password by design — SSO doesn't
+need one. If you genuinely need to log in from somewhere that isn't
+behind OpenHost owner auth, mint a password on demand from the
+OpenHost system terminal:
 
 ```sh
 podman exec openhost-mastodon \
-    cat /data/app_data/mastodon/admin-password.txt
+    s6-setuidgid mastodon env HOME=/tmp \
+    /opt/mastodon/bin/tootctl accounts modify operator --reset-password
 ```
 
-If you prefer to read it from the host directly, find the host path
-once with:
+`tootctl` prints the new password to stdout (it is not written to
+disk). Log in with it at `https://mastodon.<your-zone>/auth/sign_in`
+using the email `operator@mastodon.<your-zone>`, then change it from
+**Preferences → Account → Change password**.
 
-```sh
-podman inspect openhost-mastodon \
-    --format '{{ range .Mounts }}{{ if eq .Destination "/data/app_data/mastodon" }}{{ .Source }}{{ end }}{{ end }}'
-```
+### Owner SSO isn't logging me in
 
-and `cat $THAT_PATH/admin-password.txt`.
+1. **The session-minter is still booting.** First boot needs ~10 s of
+   extra Rails cold-boot before SSO is live; until then owners see the
+   normal login form. Wait for `app_logs/mastodon` to show
+   `[session-minter] ready` and try again.
 
-> Note: `GET /app_logs/<app>` does **not** reliably contain the
-> bootstrap script's output. Bootstrap is an s6-overlay oneshot and
-> its stderr is not always plumbed into the same log podman shows
-> for the longruns. Use the file, not the log endpoint.
-
-The username is `operator` (Mastodon reserves `admin` so we use
-`operator` like the openhost-forgejo wrapper does). Log in at
-`https://mastodon.<your-zone>/auth/sign_in` with the email
-`operator@mastodon.<your-zone>` and the printed password. Change the
-password from **Preferences → Account → Change password** on first
-login and remove the file from `$OPENHOST_APP_DATA_DIR`.
-
-### What if `admin-password.txt` is missing?
-
-If the file is absent on a running instance, one of two things has
-happened:
-
-1. **The bootstrap is still in progress.** First boot can take 5–10
-   minutes (db:migrate runs ~250 migrations + Rails cold-boot for
-   tootctl). Wait for `app_logs/mastodon` to show puma serving
-   requests, then check again.
-
-2. **The bootstrap is finished and the file was never written.** This
-   was a real bug in earlier builds: the marker file
-   (`.admin-bootstrapped`) could be written even when admin creation
-   silently failed, leaving the instance with no working admin and
-   no auto-retry. Newer builds detect this and write a placeholder
-   `admin-password.txt` containing the recovery instructions, but if
-   you're on an old build the file is just missing.
-
-   To recover, reset the password manually from the OpenHost system
-   terminal:
-
-   ```sh
-   # Try to reset; if the user doesn't exist, fall through to create.
-   podman exec openhost-mastodon \
-       s6-setuidgid mastodon env HOME=/tmp \
-       /opt/mastodon/bin/tootctl accounts modify operator --reset-password \
-   || podman exec openhost-mastodon \
-       s6-setuidgid mastodon env HOME=/tmp \
-       /opt/mastodon/bin/tootctl accounts create operator \
-           --email operator@$LOCAL_DOMAIN \
-           --confirmed --role Owner
-   ```
-
-   tootctl prints the new password to stdout. Log in with it, change
-   it from Preferences → Account → Change password, and you're back
-   in business.
+2. **You're not visiting as the zone owner.** SSO only fires for the
+   authenticated OpenHost owner (the router stamps
+   `X-OpenHost-Is-Owner: true`). Anonymous visitors and remote
+   fediverse servers deliberately never get auto-logged-in.
 
 ## Configuration knobs
 
@@ -247,15 +268,23 @@ ENV block in the Dockerfile:
 
 - `Dockerfile` — multi-stage. Pulls the upstream Mastodon Ruby image
   as base, the Mastodon streaming Node image for `/opt/mastodon-streaming`,
-  installs postgres-15, redis, caddy, and s6-overlay v3 from apt.
+  installs postgres-15, redis, caddy, python3, and s6-overlay v3 from apt.
 - `openhost.toml` — OpenHost manifest. `public_paths = ["/"]`, 3 GB
   RAM, 2 CPUs.
 - `rootfs/etc/s6-overlay/s6-rc.d/*` — service definitions. One dir
   per supervised service; `type` + `run` (longruns) or `up` (oneshots).
 - `rootfs/opt/openhost/{pg-init,secrets-init,bootstrap}.sh` — the
   three first-boot scripts.
-- `rootfs/etc/caddy/Caddyfile` — splits `/api/v1/streaming` to node,
-  everything else to puma; rewrites Host from X-Forwarded-Host.
+- `rootfs/opt/openhost/auth_proxy.py` — the SSO front-door on :8080.
+  Reverse-proxies to Caddy; adds OpenHost owner auto-login. Stdlib
+  Python only.
+- `rootfs/opt/openhost/session_minter.rb` — warm-Rails cookie minter.
+  Turns an `X-OpenHost-Is-Owner` navigation into a real Mastodon
+  session for `operator` by minting `_mastodon_session` + `_session_id`
+  through Rails' own cookie jar. Listens on a loopback UNIX socket.
+- `rootfs/etc/caddy/Caddyfile` — listens on :8090 behind the
+  auth-proxy; splits `/api/v1/streaming` to node, everything else to
+  puma; rewrites Host from X-Forwarded-Host.
 
 ## Limitations / future work
 
