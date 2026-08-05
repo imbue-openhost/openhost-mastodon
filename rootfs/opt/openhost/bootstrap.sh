@@ -338,9 +338,18 @@ fi
 bootstrap_admin() {
     local output rc password
     set +e
+    # `--confirmed` marks the email confirmed (we can't deliver a
+    # confirmation mail). `--approve` marks the account approved — this
+    # is essential: on an instance with registrations closed (our
+    # default), Mastodon's set_approved callback would otherwise leave a
+    # tootctl-created account `approved: false`, and every authenticated
+    # request would be bounced to /auth/edit ("pending review"). Both
+    # confirmed AND approved are required for User#functional?.
+    # `--role Owner` grants the highest permission level.
     output=$(mastodon_run /opt/mastodon/bin/tootctl accounts create "$ADMIN_USER" \
             --email "$ADMIN_EMAIL" \
             --confirmed \
+            --approve \
             --role Owner 2>&1)
     rc=$?
     set -e
@@ -395,6 +404,38 @@ else
             log "WARN: if this persists, run tootctl manually inside the container"
             ;;
     esac
+fi
+
+# ----- 7. ensure the owner account is functional (every boot) ------------
+#
+# Runs unconditionally (even when the create step above was skipped via
+# the marker) so an account created by an older build — which did NOT
+# pass --approve and is therefore stuck `approved: false` and bounced to
+# /auth/edit on every request — is healed in place on the next deploy,
+# with no data wipe. `tootctl accounts modify --confirm --approve` is
+# idempotent: it's a no-op once the account is already confirmed +
+# approved. Both flags are required for User#functional?, which is what
+# gates access to the app after login.
+#
+# Non-fatal: if this fails (e.g. the account genuinely doesn't exist yet
+# on a still-migrating first boot) we log and move on rather than block
+# the longruns from starting.
+if s6-setuidgid postgres /usr/lib/postgresql/15/bin/psql \
+        -h /var/run/postgresql -U postgres -d mastodon -tAc \
+        "SELECT 1 FROM accounts WHERE username='${ADMIN_USER}' AND domain IS NULL" \
+        2>/dev/null | grep -q 1; then
+    log "ensuring owner account '$ADMIN_USER' is confirmed + approved (idempotent)"
+    set +e
+    modify_out=$(mastodon_run /opt/mastodon/bin/tootctl accounts modify "$ADMIN_USER" \
+            --confirm --approve 2>&1)
+    modify_rc=$?
+    set -e
+    if [[ $modify_rc -ne 0 ]]; then
+        log "WARN: could not confirm/approve '$ADMIN_USER' (exit $modify_rc):"
+        echo "$modify_out" >&2
+    fi
+else
+    log "owner account '$ADMIN_USER' not present yet; skipping confirm/approve"
 fi
 
 log "bootstrap complete"
