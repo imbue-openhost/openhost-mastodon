@@ -69,6 +69,14 @@ OWNER_HEADER = "x-openhost-is-owner"
 # — that avoids clobbering a real login and avoids a redirect loop.
 MASTODON_SESSION_COOKIES = ("_mastodon_session", "_session_id")
 
+# Anti-loop guard. We set this short-lived marker cookie on the
+# auto-login redirect. If an owner comes back to us STILL without a
+# Mastodon session but WITH this marker, the browser is not storing the
+# minted session cookies (private-mode edge cases, cookie policy, clock
+# skew rejecting the expiry, etc.). Rather than mint again and loop, we
+# pass through to Mastodon's normal login form and clear the marker.
+AUTOLOGIN_MARKER_COOKIE = "_oh_sso_attempt"
+
 # Paths we must never auto-login on even for the owner: the login/logout
 # machinery, the streaming endpoint, and anything that isn't a browser
 # navigation. Auto-login only makes sense for top-level HTML GETs.
@@ -160,12 +168,16 @@ class Handler(BaseHTTPRequestHandler):
             return xff.split(",")[0].strip()
         return self.client_address[0] if self.client_address else "127.0.0.1"
 
-    def _has_mastodon_session(self):
+    def _cookie_present(self, name):
         raw = self.headers.get("Cookie", "")
-        if not raw:
-            return False
+        return bool(raw) and f"{name}=" in raw
+
+    def _has_mastodon_session(self):
         # Cheap substring check is enough — cookie names are distinctive.
-        return any(f"{name}=" in raw for name in MASTODON_SESSION_COOKIES)
+        return any(self._cookie_present(name) for name in MASTODON_SESSION_COOKIES)
+
+    def _autologin_already_attempted(self):
+        return self._cookie_present(AUTOLOGIN_MARKER_COOKIE)
 
     def _is_owner(self):
         return self.headers.get(OWNER_HEADER, "").strip().lower() == "true"
@@ -184,6 +196,7 @@ class Handler(BaseHTTPRequestHandler):
         return (
             self._is_owner()
             and not self._has_mastodon_session()
+            and not self._autologin_already_attempted()
             and self._is_html_navigation()
             and not self._path_blocks_autologin()
         )
@@ -258,6 +271,16 @@ class Handler(BaseHTTPRequestHandler):
                     f"HttpOnly; Secure; SameSite=Lax"
                 )
                 self.send_header("Set-Cookie", cookie)
+            # Anti-loop marker: if the browser bounces back to us still
+            # without a Mastodon session but carrying this, we'll stop
+            # minting and let the login form through. 5-minute lifetime so
+            # a normal (successful) login clears it well within the window
+            # and a genuinely fresh login attempt later isn't blocked.
+            self.send_header(
+                "Set-Cookie",
+                f"{AUTOLOGIN_MARKER_COOKIE}=1; Path=/; Max-Age=300; "
+                f"HttpOnly; Secure; SameSite=Lax",
+            )
             self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
