@@ -191,8 +191,11 @@ an empty void when you first sign in:
 - A friendly **About-page description** (only if you haven't set one).
 - A few well-known fediverse accounts are **followed for you**
   (`@Mastodon@mastodon.social`, `@fediverse@mastodon.social`,
-  `@feditips@mstdn.social`), so your Home timeline starts filling up as
-  their posts federate in over the next few minutes.
+  `@feditips@mstdn.social`).
+- Their **recent posts are backfilled** into your Home timeline right
+  away (pulled from each account's ActivityPub outbox), so you land in a
+  populated feed instead of an empty one that only fills later. Tune the
+  amount with `SEED_BACKFILL_PER_ACCOUNT` (default 10 posts each).
 
 This runs **once** (gated by `$OPENHOST_APP_DATA_DIR/.seeded`) and is
 best-effort — if a remote server is unreachable at boot the follow is
@@ -212,9 +215,11 @@ $OPENHOST_APP_DATA_DIR/
 │                              # SECRET_KEY_BASE, OTP_SECRET, VAPID
 │                              # keypair, postgres password.
 ├── local-domain               # The federation identity. PERMANENT.
+├── owner-username             # The owner account's username. PERMANENT
+│                              # once set (Mastodon can't rename).
 ├── .admin-bootstrapped        # Marker so admin creation runs once.
 └── .seeded                    # Marker so first-boot content seeding
-                               # runs once (welcome post + starter follows).
+                               # runs once (welcome post + follows + backfill).
 ```
 
 Everything in here is on the OpenHost-backed-up volume.
@@ -236,12 +241,19 @@ Everything in here is on the OpenHost-backed-up volume.
 
 Just open `https://mastodon.<your-zone>` **as the zone owner**. The
 OpenHost router recognises you and the app's SSO sidecar logs you
-straight in as the `operator` Owner account — no password, nothing to
-copy out of the container. See [Owner SSO](#owner-sso) for the
-mechanics.
+straight in as your Owner account (username from
+`OPENHOST_OWNER_USERNAME`) — no password, nothing to copy out of the
+container. See [Owner SSO](#owner-sso) for the mechanics.
 
-The account username is `operator` (Mastodon reserves `admin`, so we
-use `operator` like the openhost-forgejo wrapper does).
+The account username is your OpenHost zone owner's username, taken from
+the `OPENHOST_OWNER_USERNAME` env var the platform injects (sanitized to
+Mastodon's `[a-z0-9_]` rule), so your fediverse handle is
+`@<you>@mastodon.<your-zone>`. If that variable is unavailable it falls
+back to `owner`. The chosen username is pinned on first boot to
+`$OPENHOST_APP_DATA_DIR/owner-username` and never changed afterwards —
+Mastodon can't rename a local account once it federates. (Instances
+first bootstrapped by an older build keep their original `operator`
+username; upgrading in place does not and cannot rename them.)
 
 ### I need a password (non-SSO device / API tooling)
 
@@ -284,7 +296,8 @@ ENV block in the Dockerfile:
 | `WEB_DOMAIN` | same as `LOCAL_DOMAIN` | If you want the web UI on a separate hostname. Has its own caveats; see Mastodon docs. |
 | `SMTP_DELIVERY_METHOD` | `test` | Set to `smtp` and configure `SMTP_SERVER`, `SMTP_LOGIN`, `SMTP_PASSWORD`, etc. to send real mail. |
 | `DEFAULT_LOCALE` | `en` | Two-letter language code. |
-| `ADMIN_USERNAME` / `ADMIN_EMAIL` | `operator` / `operator@<domain>` | Only effective on the first boot. |
+| `ADMIN_USERNAME` / `ADMIN_EMAIL` | `OPENHOST_OWNER_USERNAME` (else `owner`) / `<user>@<domain>` | Only effective on the first boot; pinned to `owner-username` cache thereafter. |
+| `SEED_BACKFILL_PER_ACCOUNT` | `10` | Recent posts pulled from each starter-followed account into the Home timeline on first boot. |
 | `LIMITED_FEDERATION_MODE` | (unset) | Set to `true` to disable outbound federation. |
 
 ## Files

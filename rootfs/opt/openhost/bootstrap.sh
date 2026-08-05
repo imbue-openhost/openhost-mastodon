@@ -275,6 +275,9 @@ mastodon_run() {
         ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY="$ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY" \
         ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY="$ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY" \
         ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT="$ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT" \
+        ADMIN_USERNAME="${ADMIN_USER:-}" \
+        OPENHOST_OWNER_USERNAME="${OPENHOST_OWNER_USERNAME:-}" \
+        SEED_BACKFILL_PER_ACCOUNT="${SEED_BACKFILL_PER_ACCOUNT:-10}" \
         RAILS_ENV=production \
         "$@"
 }
@@ -326,7 +329,87 @@ mastodon_run /usr/local/bin/bundle exec rails db:seed
 #     boot retries.
 ADMIN_MARKER="$PERSIST/.admin-bootstrapped"
 LEGACY_PW_FILE="$PERSIST/admin-password.txt"
-ADMIN_USER="${ADMIN_USERNAME:-operator}"
+
+# ----- owner username --------------------------------------------------
+#
+# The owner account username is the OpenHost zone owner's username,
+# injected by the platform as OPENHOST_OWNER_USERNAME. We prefer that so
+# the fediverse handle is @<you>@mastodon.<zone> instead of a generic
+# "operator".
+#
+# Like the federation domain, a local account's username is PERMANENT
+# once it federates — Mastodon has no rename. So we pin the value on
+# first boot into a cache file and reuse it forever after, refusing to
+# silently switch it if OPENHOST_OWNER_USERNAME later changes (which
+# would otherwise create a SECOND account and leave the original
+# orphaned). To change it you must wipe $OPENHOST_APP_DATA_DIR.
+#
+# Precedence: explicit ADMIN_USERNAME override > cached value from a
+# prior boot > sanitized OPENHOST_OWNER_USERNAME > "owner".
+#
+# Mastodon usernames must match /\A[a-z0-9_]+\z/i and be <= 30 chars.
+# We lowercase, replace every other character with '_', collapse
+# repeats, trim leading/trailing underscores, and truncate. If the
+# result is empty we fall back to "owner".
+sanitize_username() {
+    local raw="$1" out
+    out="$(printf '%s' "$raw" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/[^a-z0-9_]+/_/g; s/_+/_/g; s/^_+//; s/_+$//' \
+        | cut -c1-30)"
+    printf '%s' "$out"
+}
+
+USERNAME_CACHE_FILE="$PERSIST/owner-username"
+if [[ -n "${ADMIN_USERNAME:-}" ]]; then
+    ADMIN_USER="$(sanitize_username "$ADMIN_USERNAME")"
+    log "using operator-provided ADMIN_USERNAME=$ADMIN_USER"
+elif [[ -f "$USERNAME_CACHE_FILE" ]]; then
+    ADMIN_USER="$(cat "$USERNAME_CACHE_FILE")"
+    log "using cached owner username=$ADMIN_USER (do not change without wiping data)"
+    if [[ -n "${OPENHOST_OWNER_USERNAME:-}" ]]; then
+        EXPECTED="$(sanitize_username "$OPENHOST_OWNER_USERNAME")"
+        if [[ -n "$EXPECTED" && "$EXPECTED" != "$ADMIN_USER" ]]; then
+            log "WARNING: OPENHOST_OWNER_USERNAME sanitizes to '$EXPECTED' but cached username is '$ADMIN_USER'."
+            log "WARNING: keeping the cached value. To change it, wipe \$OPENHOST_APP_DATA_DIR and redeploy."
+        fi
+    fi
+elif [[ -f "$ADMIN_MARKER" ]]; then
+    # MIGRATION PATH: an account was already bootstrapped by an earlier
+    # build that predates the owner-username feature (username 'operator'
+    # or 'owner'), but no username cache exists yet. We must NOT switch
+    # the username to OPENHOST_OWNER_USERNAME now — Mastodon can't rename
+    # a local account, so that would orphan the existing account and its
+    # federation identity. Detect the existing owner account's real
+    # username from the DB and pin THAT. New deploys never hit this
+    # branch (no marker yet) and get OPENHOST_OWNER_USERNAME below.
+    EXISTING_USER="$(s6-setuidgid postgres /usr/lib/postgresql/15/bin/psql \
+        -h /var/run/postgresql -U postgres -d mastodon -tAc \
+        "SELECT accounts.username FROM accounts
+           JOIN users ON users.account_id = accounts.id
+           JOIN user_roles ON user_roles.id = users.role_id
+          WHERE accounts.domain IS NULL AND user_roles.name = 'Owner'
+          ORDER BY accounts.id ASC LIMIT 1" 2>/dev/null | tr -d '[:space:]')"
+    if [[ -z "$EXISTING_USER" ]]; then
+        # No Owner-role account found (unusual). Fall back to the legacy
+        # default this project shipped with.
+        EXISTING_USER="operator"
+    fi
+    ADMIN_USER="$EXISTING_USER"
+    log "existing deploy detected; pinning owner username to existing account '$ADMIN_USER' (Mastodon can't rename; wipe data to change)"
+else
+    ADMIN_USER="$(sanitize_username "${OPENHOST_OWNER_USERNAME:-}")"
+    if [[ -z "$ADMIN_USER" ]]; then
+        ADMIN_USER="owner"
+        log "OPENHOST_OWNER_USERNAME unset/empty; defaulting owner username to 'owner'"
+    else
+        log "derived owner username=$ADMIN_USER from OPENHOST_OWNER_USERNAME"
+    fi
+fi
+
+# Persist the pinned username so it's stable across boots.
+printf '%s' "$ADMIN_USER" > "$USERNAME_CACHE_FILE"
+
 ADMIN_EMAIL="${ADMIN_EMAIL:-${ADMIN_USER}@${LOCAL_DOMAIN}}"
 
 # Scrub any plaintext password file left behind by an earlier build that
@@ -466,7 +549,7 @@ elif [[ ! -f "$ADMIN_MARKER" ]]; then
     # against a half-set-up instance; retry seeding next boot.
     log "admin not bootstrapped yet; deferring content seeding"
 else
-    log "seeding first-boot content (welcome post, About text, starter follows)"
+    log "seeding first-boot content (welcome post, About text, starter follows + backfill)"
     set +e
     seed_out=$(mastodon_run /usr/local/bin/bundle exec ruby /opt/openhost/seed.rb 2>&1)
     seed_rc=$?
