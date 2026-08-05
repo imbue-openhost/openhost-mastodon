@@ -26,10 +26,12 @@
 #      (trust auth set by pg-init).
 #   4. Run db:migrate (no-op when up to date).
 #   5. On the very first boot, create an Owner account via
-#      `tootctl accounts create operator --confirmed --approve
-#      --role Owner`. The generated password is discarded, NOT written
-#      to disk — the zone owner logs in through OpenHost SSO
-#      (auth_proxy + session_minter).
+#      `tootctl accounts create <owner> --confirmed --approve
+#      --role Owner`, where <owner> is the OpenHost zone owner's
+#      username (OPENHOST_OWNER_USERNAME, sanitized; falls back to
+#      'owner'). The generated password is discarded, NOT written to
+#      disk — the zone owner logs in through OpenHost SSO (auth_proxy +
+#      session_minter).
 #   6. Ensure the owner account is confirmed + approved on every boot
 #      (heals older approved:false accounts so SSO lands in the app).
 #
@@ -297,8 +299,9 @@ mastodon_run /usr/local/bin/bundle exec rails db:seed
 
 # ----- 6. bootstrap admin user (first boot only) ------------------------
 #
-# We create a single Owner-role account (`operator`) on first boot. The
-# operator NEVER needs a password: OpenHost owner SSO (auth_proxy.py +
+# We create a single Owner-role account (username = $ADMIN_USER, the
+# OpenHost zone owner's username) on first boot. The owner NEVER needs a
+# password: OpenHost owner SSO (auth_proxy.py +
 # session_minter.rb) logs the zone owner straight into this account.
 #
 # CREDENTIAL-LEAK POLICY (this is the important change from earlier

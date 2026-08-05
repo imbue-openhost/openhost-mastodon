@@ -173,8 +173,8 @@ the first boot:
 - `initdb` runs (~5s).
 - `db:migrate` walks ~250 migrations from `2016_02_20_174730` to
   current (~60–90s).
-- `tootctl accounts create` boots Rails and creates the `operator`
-  Owner account (~30s of just Rails boot time).
+- `tootctl accounts create` boots Rails and creates the Owner account
+  (username from `OPENHOST_OWNER_USERNAME`) (~30s of Rails boot time).
 - The `session-minter` boots a second Rails instance (~10s) before
   owner SSO is available. Until it's up, an owner visit falls back to
   Mastodon's normal login form; it starts working on its own once the
@@ -194,7 +194,7 @@ OpenHost API or via the in-host terminal.
 On the very first boot the instance seeds a little content so it's not
 an empty void when you first sign in:
 
-- A **welcome post** from your `operator` account (so your profile and
+- A **welcome post** from your owner account (so your profile and
   local timeline aren't blank).
 - A friendly **About-page description** (only if you haven't set one).
 - A few well-known fediverse accounts are **followed for you**
