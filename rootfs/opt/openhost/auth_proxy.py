@@ -287,14 +287,29 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _proxy(self):
-        # Read request body if present.
+        # Read request body if present. If the client declared a
+        # Content-Length we must deliver exactly that many bytes upstream
+        # or not forward the request at all: forwarding the original
+        # Content-Length header with a short/empty body would leave the
+        # upstream (Caddy/puma) blocking on bytes that never arrive. On a
+        # read failure we bail out with a 502 rather than send a
+        # malformed, length-mismatched request.
         body = b""
         cl = self.headers.get("Content-Length")
         if cl:
             try:
                 body = self.rfile.read(int(cl))
-            except (ValueError, OSError):
-                body = b""
+            except ValueError:
+                self._send_bad_gateway()
+                return
+            except OSError as e:
+                log(f"request body read failed: {e}")
+                self._send_bad_gateway()
+                return
+            if len(body) != int(cl):
+                log("request body shorter than Content-Length; aborting")
+                self._send_bad_gateway()
+                return
 
         # Build upstream headers: copy everything except hop-by-hop.
         # Iterate items() (one tuple per header occurrence) rather than
