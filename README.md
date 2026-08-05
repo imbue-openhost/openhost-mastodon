@@ -106,10 +106,10 @@ work, but you only see what your followed accounts post).
                                    Postgres (uds) ◀────┴────▶ Redis (loopback :6379)
 ```
 
-Nine processes (postgres, redis, caddy, puma, sidekiq, node streaming,
-the auth-proxy SSO front-door, the session-minter, plus s6-overlay's
-supervisor) live in the same container. s6-rc dependency tracking
-enforces startup order:
+Ten processes (postgres, redis, caddy, puma, sidekiq, node streaming,
+the auth-proxy SSO front-door, the session-minter, the background seed
+task, plus s6-overlay's supervisor) live in the same container. s6-rc
+dependency tracking enforces startup order:
 
 1. `pg-init` (oneshot) — initdb on first boot, no-op afterwards.
 2. `secrets-init` (oneshot) — generate SECRET_KEY_BASE, OTP_SECRET,
@@ -119,9 +119,9 @@ enforces startup order:
 4. `bootstrap` (oneshot) — depends on postgres, redis, and
    secrets-init. Waits for postgres to accept connections, creates the
    `mastodon` role + database, runs `db:migrate`, and on the first
-   boot creates the `operator` Owner account via `tootctl` (the
-   generated password is discarded, never written to disk — see
-   [Owner SSO](#owner-sso)).
+   boot creates the Owner account via `tootctl` (username from
+   `OPENHOST_OWNER_USERNAME`; the generated password is discarded,
+   never written to disk — see [Owner SSO](#owner-sso)).
 5. `caddy`, `mastodon-web`, `mastodon-streaming`, `mastodon-sidekiq`,
    `session-minter` (longruns) — start in parallel after bootstrap
    exits 0. The `session-minter` boots Rails once (~10 s) and then
@@ -129,6 +129,11 @@ enforces startup order:
 6. `auth-proxy` (longrun) — the public front-door on :8080. Depends on
    `caddy`. It reverse-proxies everything to Caddy on :8090 and adds
    OpenHost owner auto-login (see [Owner SSO](#owner-sso)).
+7. `seed` (longrun) — depends on `mastodon-web`. Runs first-boot
+   content seeding (welcome post, About text, starter follows +
+   backfill) **in the background** so its live ActivityPub fetches
+   don't delay the app's first-boot health check, then idles. Runs the
+   seed once (gated by `.seeded`) and thereafter just idles.
 
 If any longrun crashes, s6 restarts it in place; `bootstrap` only
 runs once per container start.
@@ -175,8 +180,11 @@ the first boot:
   Mastodon's normal login form; it starts working on its own once the
   minter finishes booting.
 - The bundled image cold-loads ~250 MB of gem code into RAM.
-- A one-time content seed runs (welcome post + About text + a few
-  starter follows) so your instance isn't empty out of the box.
+- A one-time content seed runs in the background (welcome post + About
+  text + starter follows + a backfill of their recent posts) so your
+  instance isn't empty out of the box. It runs off the critical path, so
+  it never delays the app coming up; the timeline fills in shortly after
+  you can first log in.
 
 You can watch progress with `GET /app_logs/mastodon` from the
 OpenHost API or via the in-host terminal.

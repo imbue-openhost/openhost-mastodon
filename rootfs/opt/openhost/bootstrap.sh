@@ -32,8 +32,11 @@
 #      (auth_proxy + session_minter).
 #   6. Ensure the owner account is confirmed + approved on every boot
 #      (heals older approved:false accounts so SSO lands in the app).
-#   7. Seed first-boot content once (welcome post, About text, starter
-#      follows) so the instance isn't empty out of the box.
+#
+# First-boot content seeding (welcome post, About text, starter follows,
+# backfill) is deliberately NOT done here — it runs in the background via
+# the separate `seed` s6 longrun so its live ActivityPub fetches don't
+# block the app from coming up. See the note near the end of this file.
 #
 # When this script exits 0, the three Mastodon longruns (web, sidekiq,
 # streaming) start in parallel.
@@ -275,9 +278,6 @@ mastodon_run() {
         ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY="$ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY" \
         ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY="$ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY" \
         ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT="$ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT" \
-        ADMIN_USERNAME="${ADMIN_USER:-}" \
-        OPENHOST_OWNER_USERNAME="${OPENHOST_OWNER_USERNAME:-}" \
-        SEED_BACKFILL_PER_ACCOUNT="${SEED_BACKFILL_PER_ACCOUNT:-10}" \
         RAILS_ENV=production \
         "$@"
 }
@@ -526,45 +526,14 @@ else
     log "owner account '$ADMIN_USER' not present yet; skipping confirm/approve"
 fi
 
-# ----- 8. first-boot content seeding (once) ------------------------------
-#
-# Give the owner something to look at out of the box: a welcome post, a
-# friendly About description, and a few well-known fediverse accounts
-# followed so the Home timeline fills in as federation catches up. This
-# runs ONCE, gated by its own marker, and is entirely best-effort — a
-# failure here (e.g. a remote server unreachable at boot) never blocks
-# the app. After it runs, the instance behaves exactly like a normal
-# Mastodon; the owner posts/follows/unfollows as usual.
-#
-# Gated separately from the admin marker so that on an upgrade of an
-# instance that already had its admin bootstrapped (but never seeded) we
-# still run the seed once. The seed script is itself idempotent (it
-# checks for existing statuses / follows / description) as a second line
-# of defence.
-SEED_MARKER="$PERSIST/.seeded"
-if [[ -f "$SEED_MARKER" ]]; then
-    log "content already seeded; skipping"
-elif [[ ! -f "$ADMIN_MARKER" ]]; then
-    # Admin wasn't successfully bootstrapped this boot — don't seed
-    # against a half-set-up instance; retry seeding next boot.
-    log "admin not bootstrapped yet; deferring content seeding"
-else
-    log "seeding first-boot content (welcome post, About text, starter follows + backfill)"
-    set +e
-    seed_out=$(mastodon_run /usr/local/bin/bundle exec ruby /opt/openhost/seed.rb 2>&1)
-    seed_rc=$?
-    set -e
-    # Surface the seed script's own [seed] log lines for visibility.
-    echo "$seed_out" | grep -E '^\[seed\]' >&2 || true
-    if [[ $seed_rc -eq 0 ]]; then
-        touch "$SEED_MARKER"
-        log "content seeding complete"
-    else
-        # Non-fatal. Leave the marker absent so we retry next boot; the
-        # seed script is idempotent so a partial success won't duplicate.
-        log "WARN: content seeding exited $seed_rc; will retry next boot"
-        echo "$seed_out" | tail -5 >&2
-    fi
-fi
+# NOTE: first-boot content seeding (welcome post, About text, starter
+# follows, and the backfill of those accounts' recent posts) does NOT
+# run here. It is handled by the separate `seed` s6 longrun, which runs
+# it in the BACKGROUND after the app is already serving. Seeding does
+# several live ActivityPub fetches that can take a while; running it
+# inline in this blocking bootstrap oneshot would delay the web/caddy/
+# minter longruns and make the app miss its first-boot health check
+# (OpenHost then flags the app "error"). See
+# rootfs/etc/s6-overlay/s6-rc.d/seed/run.
 
 log "bootstrap complete"

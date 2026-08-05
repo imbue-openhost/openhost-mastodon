@@ -1,0 +1,99 @@
+#!/command/with-contenv bash
+# seed longrun.
+#
+# Runs first-boot content seeding (welcome post, About text, starter
+# follows, and a backfill of those accounts' recent posts) ONCE, in the
+# BACKGROUND, after the app is already up.
+#
+# Why a separate longrun instead of running this inline in bootstrap?
+# The backfill makes several live ActivityPub fetches (resolve accounts,
+# pull outboxes, import statuses) — seconds to minutes depending on the
+# remote servers. bootstrap is an s6 oneshot that BLOCKS the web/caddy/
+# minter longruns until it exits, so seeding there delays the app from
+# answering its health check on first boot and OpenHost marks the app
+# "error". Running seeding as its own longrun that depends on
+# mastodon-web means the app is serving immediately and the (slow, best
+# effort) seeding happens off to the side.
+#
+# Lifecycle: on first boot it runs seed.rb, writes the .seeded marker on
+# success, then sleeps forever (s6 keeps longruns supervised; we don't
+# want it to exit-and-restart-loop). On every subsequent boot it sees
+# the marker and goes straight to sleeping. It is therefore effectively
+# a run-once background task wearing a longrun's clothes.
+set -eu
+
+cd /opt/mastodon
+
+PERSIST="${OPENHOST_APP_DATA_DIR:-/data/app_data/mastodon}"
+SEED_MARKER="$PERSIST/.seeded"
+ADMIN_MARKER="$PERSIST/.admin-bootstrapped"
+
+# Idle helper: sleep forever without burning CPU. Used once seeding is
+# done (or not applicable) so s6 keeps the service "up" without looping.
+idle_forever() {
+    # `exec sleep infinity` replaces this shell; s6 supervises the sleep.
+    exec sleep infinity
+}
+
+if [[ -f "$SEED_MARKER" ]]; then
+    echo "[seed-svc] content already seeded; idling" >&2
+    idle_forever
+fi
+
+SECRETS_FILE="$PERSIST/mastodon-secrets.env"
+if [[ ! -f "$SECRETS_FILE" ]]; then
+    echo "[seed-svc] secrets file missing; idling (nothing to seed)" >&2
+    idle_forever
+fi
+# shellcheck disable=SC1090
+set -a; source "$SECRETS_FILE"; set +a
+
+# Owner username is pinned by bootstrap into this cache; pass it to the
+# seed script so it targets the right account.
+OWNER_USERNAME_FILE="$PERSIST/owner-username"
+if [[ -f "$OWNER_USERNAME_FILE" ]]; then
+    SEED_ADMIN_USERNAME="$(cat "$OWNER_USERNAME_FILE")"
+else
+    SEED_ADMIN_USERNAME="${OPENHOST_OWNER_USERNAME:-owner}"
+fi
+
+# Only seed once the admin account actually exists (bootstrap writes the
+# admin marker after creating it). If it's not ready yet — e.g. a very
+# slow first boot where bootstrap hasn't finished — wait a bounded while
+# for it rather than seeding against a half-set-up instance.
+for _ in $(seq 1 60); do
+    [[ -f "$ADMIN_MARKER" ]] && break
+    sleep 5
+done
+if [[ ! -f "$ADMIN_MARKER" ]]; then
+    echo "[seed-svc] admin not bootstrapped after wait; idling, will seed next boot" >&2
+    idle_forever
+fi
+
+# Give the web/DB a moment to be fully ready (bootstrap already ran
+# migrations, but the account row + roles must be queryable).
+sleep 5
+
+echo "[seed-svc] seeding first-boot content (welcome post, About, follows + backfill)" >&2
+set +e
+s6-setuidgid mastodon env \
+    HOME=/tmp \
+    ADMIN_USERNAME="$SEED_ADMIN_USERNAME" \
+    OPENHOST_OWNER_USERNAME="${OPENHOST_OWNER_USERNAME:-}" \
+    SEED_BACKFILL_PER_ACCOUNT="${SEED_BACKFILL_PER_ACCOUNT:-10}" \
+    RAILS_ENV=production \
+    /usr/local/bin/bundle exec ruby /opt/openhost/seed.rb
+seed_rc=$?
+set -e
+
+if [[ $seed_rc -eq 0 ]]; then
+    touch "$SEED_MARKER"
+    echo "[seed-svc] seeding complete" >&2
+else
+    # Non-fatal: leave the marker absent so we retry on the next boot.
+    # The seed script is idempotent, so a partial success won't
+    # duplicate posts/follows.
+    echo "[seed-svc] WARN: seeding exited $seed_rc; will retry next boot" >&2
+fi
+
+idle_forever

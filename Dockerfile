@@ -136,7 +136,7 @@ RUN chmod +x /opt/openhost/*.sh /etc/s6-overlay/s6-rc.d/*/run \
 RUN mkdir -p /etc/s6-overlay/s6-rc.d/user/contents.d \
  && for svc in pg-init secrets-init bootstrap postgres redis caddy \
                mastodon-web mastodon-streaming mastodon-sidekiq \
-               session-minter auth-proxy; do \
+               session-minter auth-proxy seed; do \
         touch /etc/s6-overlay/s6-rc.d/user/contents.d/$svc; \
     done
 
