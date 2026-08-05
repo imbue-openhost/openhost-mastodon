@@ -256,7 +256,31 @@ if followed_accounts.any? && BACKFILL_PER_ACCOUNT.positive?
       log "backfill failed for #{account.acct}: #{e.class}: #{e.message}"
     end
   end
-  log "backfill total: #{total} post(s) imported into the Home timeline"
+  log "backfill total: #{total} imported"
+end
+
+# ---------------------------------------------------------------------------
+# 5. Rebuild the owner's Home feed so the backfilled posts appear.
+# ---------------------------------------------------------------------------
+#
+# CRITICAL: importing a followed account's statuses (step 4) writes them
+# to the DB but does NOT retroactively fan them into the owner's Home
+# timeline. Mastodon's Home feed is a per-user list materialised in
+# Redis; it only receives posts that arrive AFTER the follow (via
+# FanOutOnWriteService). The statuses we just backfilled predate the
+# follow, so without an explicit rebuild the owner's Home feed stays
+# empty even though the posts exist — which is exactly the "SSO works
+# but Home is empty" symptom.
+#
+# PrecomputeFeedService (what `tootctl feeds build <user>` calls)
+# regenerates the Home feed from the DB, pulling in the followed
+# accounts' recent cached statuses. Run it last, after the follows +
+# backfill, so the owner opens Mastodon to a populated Home timeline.
+begin
+  PrecomputeFeedService.new.call(owner)
+  log 'rebuilt owner Home feed from backfilled posts'
+rescue => e
+  log "could not rebuild Home feed: #{e.class}: #{e.message}"
 end
 
 log 'seeding complete'

@@ -207,7 +207,8 @@ an empty void when you first sign in:
   (`@Mastodon@mastodon.social`, `@fediverse@mastodon.social`,
   `@feditips@mstdn.social`).
 - Their **recent posts are backfilled** into your Home timeline right
-  away (pulled from each account's ActivityPub outbox), so you land in a
+  away (pulled from each account's ActivityPub outbox, then the Home
+  feed is rebuilt so those posts actually show up), so you land in a
   populated feed instead of an empty one that only fills later. Tune the
   amount with `SEED_BACKFILL_PER_ACCOUNT` (default 10 posts each).
 

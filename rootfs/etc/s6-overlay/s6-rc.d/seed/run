@@ -25,7 +25,14 @@ set -eu
 cd /opt/mastodon
 
 PERSIST="${OPENHOST_APP_DATA_DIR:-/data/app_data/mastodon}"
-SEED_MARKER="$PERSIST/.seeded"
+# Marker is versioned. Bumping the version re-runs the (idempotent) seed
+# once on an already-seeded instance so a seeding improvement reaches it
+# without a data wipe. v2 adds the Home-feed rebuild that makes the
+# backfilled posts actually appear on the owner's Home timeline (an
+# instance seeded by v1 imported the posts but never rebuilt the feed,
+# so Home looked empty). seed.rb is idempotent — re-running it won't
+# duplicate the welcome post or re-follow accounts.
+SEED_MARKER="$PERSIST/.seeded-v2"
 ADMIN_MARKER="$PERSIST/.admin-bootstrapped"
 
 # Idle helper: sleep forever without burning CPU. Used once seeding is
