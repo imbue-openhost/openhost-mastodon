@@ -12,7 +12,7 @@ sidecar, into a single container supervised by
 
 Deploy via the OpenHost router. Once it's up, just open
 `https://mastodon.<your-zone>` **as the zone owner** — OpenHost SSO
-logs you straight in as the instance admin (`operator`). No password to
+logs you straight in as the instance admin (your owner account). No password to
 copy, nothing to read out of the container. Start posting. See
 [Owner SSO](#owner-sso) for how it works and how to recover a password
 if you ever need one for a non-SSO device.
@@ -126,9 +126,15 @@ dependency tracking enforces startup order:
    `session-minter` (longruns) — start in parallel after bootstrap
    exits 0. The `session-minter` boots Rails once (~10 s) and then
    serves cookie-mint requests over a loopback UNIX socket.
-6. `auth-proxy` (longrun) — the public front-door on :8080. Depends on
-   `caddy`. It reverse-proxies everything to Caddy on :8090 and adds
-   OpenHost owner auto-login (see [Owner SSO](#owner-sso)).
+6. `auth-proxy` (longrun) — the public front-door on :8080. It has **no
+   s6 dependencies on purpose**, so it starts at the very beginning of
+   stage 2, before `bootstrap` runs db:migrate. That's what keeps :8080
+   answering during the slow first boot: it serves the health path with
+   a 200 "starting" placeholder until the Caddy/puma backend is up (and
+   stops faking it the moment the backend is first reachable, so a real
+   later crash still surfaces), then reverse-proxies everything to Caddy
+   on :8090 and adds OpenHost owner auto-login (see
+   [Owner SSO](#owner-sso)).
 7. `seed` (longrun) — depends on `mastodon-web`. Runs first-boot
    content seeding (welcome post, About text, starter follows +
    backfill) **in the background** so its live ActivityPub fetches
@@ -144,7 +150,7 @@ The OpenHost router authenticates the zone owner and stamps
 `X-OpenHost-Is-Owner: true` on the upstream request. On the owner's
 first top-level HTML navigation that doesn't already carry a Mastodon
 session cookie, the `auth-proxy` asks the `session-minter` to create a
-real Mastodon login session for the `operator` account and 302s the
+real Mastodon login session for the owner account and 302s the
 owner back to the URL they asked for with the minted
 `_mastodon_session` + `_session_id` cookies. From then on Mastodon's
 own session carries them.
@@ -265,20 +271,23 @@ username; upgrading in place does not and cannot rename them.)
 
 ### I need a password (non-SSO device / API tooling)
 
-The `operator` account has no known password by design — SSO doesn't
+The owner account has no known password by design — SSO doesn't
 need one. If you genuinely need to log in from somewhere that isn't
 behind OpenHost owner auth, mint a password on demand from the
-OpenHost system terminal:
+OpenHost system terminal. Your account username is in
+`$OPENHOST_APP_DATA_DIR/owner-username` (it's your OpenHost owner
+username, e.g. `andrew`); substitute it below:
 
 ```sh
+OWNER=$(podman exec openhost-mastodon cat /data/app_data/mastodon/owner-username)
 podman exec openhost-mastodon \
     s6-setuidgid mastodon env HOME=/tmp \
-    /opt/mastodon/bin/tootctl accounts modify operator --reset-password
+    /opt/mastodon/bin/tootctl accounts modify "$OWNER" --reset-password
 ```
 
 `tootctl` prints the new password to stdout (it is not written to
 disk). Log in with it at `https://mastodon.<your-zone>/auth/sign_in`
-using the email `operator@mastodon.<your-zone>`, then change it from
+using the email `<owner>@mastodon.<your-zone>`, then change it from
 **Preferences → Account → Change password**.
 
 ### Owner SSO isn't logging me in
@@ -324,7 +333,7 @@ ENV block in the Dockerfile:
   Python only.
 - `rootfs/opt/openhost/session_minter.rb` — warm-Rails cookie minter.
   Turns an `X-OpenHost-Is-Owner` navigation into a real Mastodon
-  session for `operator` by minting `_mastodon_session` + `_session_id`
+  session for the owner by minting `_mastodon_session` + `_session_id`
   through Rails' own cookie jar. Listens on a loopback UNIX socket.
 - `rootfs/etc/caddy/Caddyfile` — listens on :8090 behind the
   auth-proxy; splits `/api/v1/streaming` to node, everything else to
