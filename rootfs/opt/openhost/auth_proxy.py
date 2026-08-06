@@ -9,13 +9,26 @@ The *only* behaviour this proxy adds on top of a transparent reverse
 proxy is owner auto-login:
 
   When the OpenHost router forwards a request from the authenticated
-  zone owner it stamps `X-OpenHost-Is-Owner: true`. On the owner's first
-  top-level HTML navigation that does not already carry a Mastodon
-  session cookie, we ask the Ruby session-minter (over a loopback UNIX
-  socket) to mint a real Mastodon session for the bootstrap `operator`
-  account, then 302 the owner back to the URL they asked for with the
-  minted cookies attached. From then on Mastodon's own session cookies
-  carry them and this proxy is a pure passthrough.
+  zone owner it stamps `X-OpenHost-Is-Owner: true`. We ask the Ruby
+  session-minter (over a loopback UNIX socket) to mint a real Mastodon
+  session for the owner account and 302 the owner in with the minted
+  cookies attached. Auto-login triggers in two cases (see
+  _should_autologin):
+
+    * a fresh owner on a normal page with no Mastodon session cookie, or
+    * an owner served Mastodon's /auth/sign_in page — which is where
+      Mastodon sends them when their session is missing OR STALE. This
+      is the important case: Mastodon issues session cookies for a year
+      but its server-side session dies sooner (it caps
+      session_activations rows at 10 and purges the oldest, and logs the
+      user out when the _session_id cookie has no matching row), leaving
+      dead cookies in the browser. So we do NOT treat cookie presence as
+      "logged in"; we re-mint on the sign-in bounce regardless, and
+      redirect to the app root. From then on Mastodon's own session
+      cookies carry them and this proxy is a pure passthrough. A normal
+      page that already carries cookies is passed through untouched (no
+      session_activations churn); if that session is actually stale
+      Mastodon bounces it to /auth/sign_in, where the re-mint kicks in.
 
 Everything else — federation inbox deliveries, WebFinger, public
 timelines, the streaming WebSocket, anonymous visitors reading public
