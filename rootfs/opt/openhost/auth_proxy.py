@@ -80,24 +80,40 @@ HEALTH_PATH = os.environ.get("HEALTH_PATH", "/health")
 # Header the OpenHost router stamps for the authenticated zone owner.
 OWNER_HEADER = "x-openhost-is-owner"
 
-# Mastodon session cookies. If any of these is already present we treat
-# the visitor as having a (possibly stale) session and do NOT auto-login
-# — that avoids clobbering a real login and avoids a redirect loop.
+# Mastodon session cookies.
+#
+# IMPORTANT: the presence of these cookies does NOT mean the visitor has a
+# *valid* session. Mastodon issues them for a year, but the server-side
+# session can die well before that: every login creates a
+# `session_activations` row, Mastodon caps those at 10 and purges the
+# oldest, and the Warden after_fetch hook (config/initializers/devise.rb)
+# logs the user out — while leaving the year-long cookies in the browser —
+# whenever the `_session_id` cookie has no matching row. So a browser can
+# hold "session" cookies that Mastodon rejects, landing the owner on
+# /auth/sign_in. We therefore do NOT gate auto-login on cookie presence
+# alone; instead we treat an owner being SHOWN the sign-in page as the
+# signal to (re)mint. See _should_autologin.
 MASTODON_SESSION_COOKIES = ("_mastodon_session", "_session_id")
 
+# Mastodon's sign-in path. When the OpenHost owner is served this, their
+# Mastodon session is missing or stale (possibly with dead cookies still
+# in the browser) — the trigger to (re)mint a fresh session.
+SIGN_IN_PATH = "/auth/sign_in"
+
 # Anti-loop guard. We set this short-lived marker cookie on the
-# auto-login redirect. If an owner comes back to us STILL without a
-# Mastodon session but WITH this marker, the browser is not storing the
-# minted session cookies (private-mode edge cases, cookie policy, clock
-# skew rejecting the expiry, etc.). Rather than mint again and loop, we
-# pass through to Mastodon's normal login form and clear the marker.
+# auto-login redirect. If an owner comes back to us STILL landing on the
+# sign-in page but WITH this marker, minting isn't sticking (browser not
+# storing the cookies, clock skew rejecting the expiry, etc.). Rather than
+# mint again and loop, we pass through to Mastodon's normal login form.
 AUTOLOGIN_MARKER_COOKIE = "_oh_sso_attempt"
 
-# Paths we must never auto-login on even for the owner: the login/logout
-# machinery, the streaming endpoint, and anything that isn't a browser
-# navigation. Auto-login only makes sense for top-level HTML GETs.
+# Paths we must never auto-login on even for the owner: the streaming
+# endpoint, federation/API endpoints, assets, and — critically — the
+# logout/registration flows under /auth/ EXCEPT the sign-in page itself
+# (which is exactly where a stale/expired owner lands and must be
+# re-authed). Auto-login only makes sense for top-level HTML GETs.
 NO_AUTOLOGIN_PREFIXES = (
-    "/auth/",           # Devise sign-in/out/registration
+    "/auth/",           # Devise sign-in/out/registration (sign_in re-allowed below)
     "/api/",            # REST + streaming; never HTML navigations
     "/oauth/",          # OAuth authorize/token
     "/.well-known/",    # WebFinger, nodeinfo, host-meta
@@ -231,16 +247,40 @@ class Handler(BaseHTTPRequestHandler):
 
     def _path_blocks_autologin(self):
         path = urllib.parse.urlparse(self.path).path
+        # The sign-in page is the one /auth/ path we DO auto-login on: it's
+        # where Mastodon sends an owner whose session is missing or stale.
+        if path == SIGN_IN_PATH:
+            return False
         return any(path.startswith(p) for p in NO_AUTOLOGIN_PREFIXES)
 
     def _should_autologin(self):
-        return (
+        # Only ever act for the authenticated OpenHost owner, on a top-level
+        # HTML navigation, and never twice in a row (loop guard).
+        if not (
             self._is_owner()
-            and not self._has_mastodon_session()
-            and not self._autologin_already_attempted()
             and self._is_html_navigation()
+            and not self._autologin_already_attempted()
             and not self._path_blocks_autologin()
-        )
+        ):
+            return False
+
+        path = urllib.parse.urlparse(self.path).path
+
+        # Case 1 — the owner is being shown the sign-in page. Their Mastodon
+        # session is missing or STALE (Mastodon may have purged the
+        # session_activations row while leaving year-long cookies in the
+        # browser). Re-mint regardless of whether cookies are present; this
+        # is the fix for "worked at first, then stopped authing".
+        if path == SIGN_IN_PATH:
+            return True
+
+        # Case 2 — a normal page with no Mastodon session cookie at all: a
+        # fresh owner who hasn't been logged in yet. Mint. If cookies ARE
+        # present on a normal page we pass through: the owner has a session,
+        # and if it turns out to be stale Mastodon will bounce them to the
+        # sign-in page, where Case 1 catches it. This avoids re-minting (and
+        # churning session_activations rows) on every ordinary page load.
+        return not self._has_mastodon_session()
 
     # ---- request entrypoints -----------------------------------------
 
@@ -313,14 +353,20 @@ class Handler(BaseHTTPRequestHandler):
         self._proxy()
 
     def _send_autologin_redirect(self, cookies):
-        """302 back to the same URL, attaching the minted session cookies.
+        """302 with the minted session cookies attached.
 
-        We redirect to the exact URL the owner requested so that after
-        the browser stores the cookies and re-requests, this proxy sees
-        _mastodon_session present, skips auto-login, and proxies through
-        to a now-authenticated Mastodon.
+        We redirect back to the URL the owner requested so that after the
+        browser stores the cookies and re-requests, this proxy sees the
+        session and proxies through to a now-authenticated Mastodon.
+
+        Exception: if the trigger was the sign-in page (a stale/missing
+        session), there's no meaningful "original destination" to return
+        to — sending them back to /auth/sign_in would just make Mastodon
+        bounce an authenticated user onward. Redirect to the app root
+        instead so they land in the app directly.
         """
-        location = self.path  # same path+query, relative redirect
+        path = urllib.parse.urlparse(self.path).path
+        location = "/" if path == SIGN_IN_PATH else self.path
         body = b"Signing you in..."
         try:
             self.send_response(302)
@@ -336,14 +382,15 @@ class Handler(BaseHTTPRequestHandler):
                     f"HttpOnly; Secure; SameSite=Lax"
                 )
                 self.send_header("Set-Cookie", cookie)
-            # Anti-loop marker: if the browser bounces back to us still
-            # without a Mastodon session but carrying this, we'll stop
-            # minting and let the login form through. 5-minute lifetime so
-            # a normal (successful) login clears it well within the window
-            # and a genuinely fresh login attempt later isn't blocked.
+            # Anti-loop marker: if the browser bounces straight back to the
+            # sign-in page still carrying this, minting isn't sticking, so
+            # we stop and let the login form through. Kept SHORT (60s): just
+            # long enough to cover the mint -> redirect -> retry round-trip,
+            # but short enough that it never blocks a legitimate later
+            # re-auth when a session goes stale again down the line.
             self.send_header(
                 "Set-Cookie",
-                f"{AUTOLOGIN_MARKER_COOKIE}=1; Path=/; Max-Age=300; "
+                f"{AUTOLOGIN_MARKER_COOKIE}=1; Path=/; Max-Age=60; "
                 f"HttpOnly; Secure; SameSite=Lax",
             )
             self.end_headers()
