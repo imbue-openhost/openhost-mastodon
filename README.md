@@ -1,17 +1,17 @@
-# openhost-mastodon
+# bottled-mastodon
 
-[Mastodon](https://joinmastodon.org/) packaged as an OpenHost app.
+[Mastodon](https://joinmastodon.org/) packaged as a Cloud in a Bottle app.
 
 Bundles all five processes Mastodon's standard production deploy needs
 — PostgreSQL, Redis, Puma (web), Sidekiq (background workers), and the
-Node streaming server — plus a Caddy front-door and an OpenHost SSO
+Node streaming server — plus a Caddy front-door and a Cloud in a Bottle SSO
 sidecar, into a single container supervised by
 [s6-overlay v3](https://github.com/just-containers/s6-overlay).
 
 ## TL;DR
 
-Deploy via the OpenHost router. Once it's up, just open
-`https://mastodon.<your-zone>` **as the zone owner** — OpenHost SSO
+Deploy via the Cloud in a Bottle router. Once it's up, just open
+`https://mastodon.<your-zone>` **as the zone owner** — Cloud in a Bottle SSO
 logs you straight in as the instance admin (your owner account). No password to
 copy, nothing to read out of the container. Start posting. See
 [Owner SSO](#owner-sso) for how it works and how to recover a password
@@ -70,7 +70,7 @@ real federation load will OOM at this allocation.
 
 ### Anyone with the URL can read public posts
 
-`public_paths = ["/"]` in `openhost.toml` — the OpenHost owner-auth
+`public_paths = ["/"]` in `openhost.toml` — the Cloud in a Bottle owner-auth
 gate is **disabled** because federation requests come from random
 remote Mastodon instances and must not be challenged. The web UI is
 also fully public; account-level privacy is enforced by Mastodon's
@@ -133,7 +133,7 @@ dependency tracking enforces startup order:
    a 200 "starting" placeholder until the Caddy/puma backend is up (and
    stops faking it the moment the backend is first reachable, so a real
    later crash still surfaces), then reverse-proxies everything to Caddy
-   on :8090 and adds OpenHost owner auto-login (see
+   on :8090 and adds Cloud in a Bottle owner auto-login (see
    [Owner SSO](#owner-sso)).
 7. `seed` (longrun) — depends on `mastodon-web`. Runs first-boot
    content seeding (welcome post, About text, starter follows +
@@ -146,7 +146,7 @@ runs once per container start.
 
 ### Owner SSO
 
-The OpenHost router authenticates the zone owner and stamps
+The Cloud in a Bottle router authenticates the zone owner and stamps
 `X-OpenHost-Is-Owner: true` on the upstream request. On the owner's
 first top-level HTML navigation that doesn't already carry a Mastodon
 session cookie, the `auth-proxy` asks the `session-minter` to create a
@@ -168,7 +168,7 @@ deliveries, WebFinger, ActivityPub actor fetches, the streaming
 WebSocket, anonymous visitors reading public posts, non-owner logged-in
 users — flows straight through the auth-proxy untouched. The
 auto-login path is gated on `X-OpenHost-Is-Owner`, which only the
-OpenHost router can set, so remote/anonymous traffic can never trigger
+Cloud in a Bottle router can set, so remote/anonymous traffic can never trigger
 it.
 
 ## First boot is slow
@@ -193,7 +193,7 @@ the first boot:
   you can first log in.
 
 You can watch progress with `GET /app_logs/mastodon` from the
-OpenHost API or via the in-host terminal.
+Cloud in a Bottle API or via the in-host terminal.
 
 ## Out-of-the-box content
 
@@ -237,11 +237,11 @@ $OPENHOST_APP_DATA_DIR/
                                # runs once (welcome post + follows + backfill).
 ```
 
-Everything in here is on the OpenHost-backed-up volume.
+Everything in here is on the Cloud in a Bottle-backed-up volume.
 
 > **No credentials on disk.** Earlier builds wrote the admin password
 > to `admin-password.txt` here. That was a credential-leak risk —
-> OpenHost bind-mounts this directory into other apps that hold the
+> Cloud in a Bottle bind-mounts this directory into other apps that hold the
 > `access_all_data` permission (e.g. the file-browser app), so the
 > plaintext password was readable by them. That file is gone: the
 > owner logs in via SSO and the bootstrap discards the generated
@@ -255,12 +255,12 @@ Everything in here is on the OpenHost-backed-up volume.
 ## Logging in as admin
 
 Just open `https://mastodon.<your-zone>` **as the zone owner**. The
-OpenHost router recognises you and the app's SSO sidecar logs you
+Cloud in a Bottle router recognises you and the app's SSO sidecar logs you
 straight in as your Owner account (username from
 `OPENHOST_OWNER_USERNAME`) — no password, nothing to copy out of the
 container. See [Owner SSO](#owner-sso) for the mechanics.
 
-The account username is your OpenHost zone owner's username, taken from
+The account username is your Cloud in a Bottle zone owner's username, taken from
 the `OPENHOST_OWNER_USERNAME` env var the platform injects (sanitized to
 Mastodon's `[a-z0-9_]` rule), so your fediverse handle is
 `@<you>@mastodon.<your-zone>`. If that variable is unavailable it falls
@@ -274,14 +274,14 @@ username; upgrading in place does not and cannot rename them.)
 
 The owner account has no known password by design — SSO doesn't
 need one. If you genuinely need to log in from somewhere that isn't
-behind OpenHost owner auth, mint a password on demand from the
-OpenHost system terminal. Your account username is in
-`$OPENHOST_APP_DATA_DIR/owner-username` (it's your OpenHost owner
+behind Cloud in a Bottle owner auth, mint a password on demand from the
+Cloud in a Bottle system terminal. Your account username is in
+`$OPENHOST_APP_DATA_DIR/owner-username` (it's your Cloud in a Bottle owner
 username, e.g. `andrew`); substitute it below:
 
 ```sh
-OWNER=$(podman exec openhost-mastodon cat /data/app_data/mastodon/owner-username)
-podman exec openhost-mastodon \
+OWNER=$(podman exec bottled-mastodon cat /data/app_data/mastodon/owner-username)
+podman exec bottled-mastodon \
     s6-setuidgid mastodon env HOME=/tmp \
     /opt/mastodon/bin/tootctl accounts modify "$OWNER" --reset-password
 ```
@@ -299,7 +299,7 @@ using the email `<owner>@mastodon.<your-zone>`, then change it from
    `[session-minter] ready` and try again.
 
 2. **You're not visiting as the zone owner.** SSO only fires for the
-   authenticated OpenHost owner (the router stamps
+   authenticated Cloud in a Bottle owner (the router stamps
    `X-OpenHost-Is-Owner: true`). Anonymous visitors and remote
    fediverse servers deliberately never get auto-logged-in.
 
@@ -310,7 +310,7 @@ ENV block in the Dockerfile:
 
 | Env var | Default | Notes |
 |---------|---------|-------|
-| `LOCAL_DOMAIN` | derived from OpenHost env | Federation identity. **Setting this manually overrides the cache file** — only do this on a brand-new deploy. |
+| `LOCAL_DOMAIN` | derived from Cloud in a Bottle env | Federation identity. **Setting this manually overrides the cache file** — only do this on a brand-new deploy. |
 | `WEB_DOMAIN` | same as `LOCAL_DOMAIN` | If you want the web UI on a separate hostname. Has its own caveats; see Mastodon docs. |
 | `SMTP_DELIVERY_METHOD` | `test` | Set to `smtp` and configure `SMTP_SERVER`, `SMTP_LOGIN`, `SMTP_PASSWORD`, etc. to send real mail. |
 | `DEFAULT_LOCALE` | `en` | Two-letter language code. |
@@ -323,14 +323,14 @@ ENV block in the Dockerfile:
 - `Dockerfile` — multi-stage. Pulls the upstream Mastodon Ruby image
   as base, the Mastodon streaming Node image for `/opt/mastodon-streaming`,
   installs postgres-15, redis, caddy, python3, and s6-overlay v3 from apt.
-- `openhost.toml` — OpenHost manifest. `public_paths = ["/"]`, 3 GB
+- `openhost.toml` — Cloud in a Bottle manifest. `public_paths = ["/"]`, 3 GB
   RAM, 2 CPUs.
 - `rootfs/etc/s6-overlay/s6-rc.d/*` — service definitions. One dir
   per supervised service; `type` + `run` (longruns) or `up` (oneshots).
 - `rootfs/opt/openhost/{pg-init,secrets-init,bootstrap}.sh` — the
   three first-boot scripts.
 - `rootfs/opt/openhost/auth_proxy.py` — the SSO front-door on :8080.
-  Reverse-proxies to Caddy; adds OpenHost owner auto-login. Stdlib
+  Reverse-proxies to Caddy; adds Cloud in a Bottle owner auto-login. Stdlib
   Python only.
 - `rootfs/opt/openhost/session_minter.rb` — warm-Rails cookie minter.
   Turns an `X-OpenHost-Is-Owner` navigation into a real Mastodon
