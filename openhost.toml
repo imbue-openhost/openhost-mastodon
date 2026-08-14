@@ -1,7 +1,7 @@
 [app]
 name = "mastodon"
 version = "0.1.0"
-description = "Mastodon — federated microblogging. Bundles postgres, redis, puma, sidekiq, streaming, Caddy, and an OpenHost owner-SSO sidecar in a single container under s6-overlay."
+description = "Mastodon — federated microblogging. Bundles postgres, redis, puma, sidekiq, streaming, Caddy, and a Cloud in a Bottle owner-SSO sidecar in a single container under s6-overlay."
 
 [runtime.container]
 image = "Dockerfile"
