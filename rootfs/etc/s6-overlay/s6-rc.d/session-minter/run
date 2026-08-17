@@ -1,0 +1,50 @@
+#!/command/with-contenv bash
+# session-minter longrun.
+#
+# Boots the Mastodon Rails environment ONCE and then serves cookie-mint
+# requests from auth_proxy.py over a loopback UNIX socket
+# ($MINTER_SOCK). This is the SSO bridge: it turns an
+# X-OpenHost-Is-Owner navigation into a real, byte-faithful Mastodon
+# login session for the bootstrap `operator` account, minting the
+# _mastodon_session + _session_id cookies through Rails' own cookie jar
+# so we never have to reimplement Rails cookie crypto outside Rails.
+#
+# Runs as the `mastodon` user (same uid as puma/sidekiq) so the socket
+# it creates is reachable by auth_proxy (also `mastodon`) and so it can
+# read the DB with the mastodon role. Sources the same secrets file the
+# other Mastodon longruns use — it needs SECRET_KEY_BASE (to sign/
+# encrypt cookies identically to puma) and DATABASE_URL (to insert
+# session_activations rows).
+#
+# First-boot cost: ~10s of Rails cold-boot before the socket appears.
+# auth_proxy degrades gracefully (owner just sees the login form) if it
+# calls before the socket is up, so there's no hard ordering
+# requirement — but we still declare a dependency on `bootstrap` so the
+# DB + admin user exist before we try to resolve the owner account.
+set -eu
+
+cd /opt/mastodon
+
+SECRETS_FILE="${OPENHOST_APP_DATA_DIR:-/data/app_data/mastodon}/mastodon-secrets.env"
+if [[ ! -f "$SECRETS_FILE" ]]; then
+    echo "[session-minter] FATAL: secrets file missing: $SECRETS_FILE" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+set -a; source "$SECRETS_FILE"; set +a
+
+# The socket lives under a runtime dir owned by mastodon so both the
+# minter and auth_proxy (both uid mastodon) can use it. /run is tmpfs;
+# recreated every boot.
+export MINTER_SOCK="${MINTER_SOCK:-/run/mastodon/minter.sock}"
+mkdir -p "$(dirname "$MINTER_SOCK")"
+chown mastodon:mastodon "$(dirname "$MINTER_SOCK")"
+
+# Bundler needs a writable HOME (mastodon user's default $HOME is
+# /root under s6-setuidgid, which it can't write to — same workaround
+# bootstrap.sh uses for its rake calls).
+exec s6-setuidgid mastodon env \
+    HOME=/tmp \
+    MINTER_SOCK="$MINTER_SOCK" \
+    RAILS_ENV=production \
+    /usr/local/bin/bundle exec ruby /opt/openhost/session_minter.rb

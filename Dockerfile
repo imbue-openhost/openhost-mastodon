@@ -95,6 +95,7 @@ RUN apt-get update \
         redis-server \
         caddy \
         gosu \
+        python3 \
  && rm -rf /var/lib/apt/lists/*
 
 # Install s6-overlay v3 (used to supervise postgres, redis, caddy, and
@@ -134,15 +135,17 @@ RUN chmod +x /opt/openhost/*.sh /etc/s6-overlay/s6-rc.d/*/run \
 # unless overridden via S6_STAGE2_HOOK.
 RUN mkdir -p /etc/s6-overlay/s6-rc.d/user/contents.d \
  && for svc in pg-init secrets-init bootstrap postgres redis caddy \
-               mastodon-web mastodon-streaming mastodon-sidekiq; do \
+               mastodon-web mastodon-streaming mastodon-sidekiq \
+               session-minter auth-proxy seed; do \
         touch /etc/s6-overlay/s6-rc.d/user/contents.d/$svc; \
     done
 
 # Pre-create state dirs (also created at runtime by bootstrap.sh, but
 # nice to have ready).
-RUN mkdir -p /run/postgresql /run/redis \
+RUN mkdir -p /run/postgresql /run/redis /run/mastodon \
  && chown postgres:postgres /run/postgresql \
- && chown redis:redis /run/redis
+ && chown redis:redis /run/redis \
+ && chown mastodon:mastodon /run/mastodon
 
 # Mastodon expects /opt/mastodon/public/system (uploads) writable by uid
 # mastodon. We bind-mount $OPENHOST_APP_DATA_DIR/mastodon-uploads on top
